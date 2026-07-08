@@ -31,6 +31,7 @@ limit pruning).
 import functools
 import math
 import os
+import time
 
 import tilelang
 import tilelang.language as T
@@ -45,16 +46,40 @@ _ANCHOR_HELPER_PATH = os.path.abspath(
 
 __all__ = ["GroupedGemmPersistent3WGKernel"]
 
+# SMEM-budget constants shared by the autotune config pruner
+# (``autotune_configs``) and the kernel builder (``_make_cooperative_kernel``).
+# Both size the K-ring against these, so they must stay single-sourced.
+_SMEM_LIMIT_BYTES = 228 * 1024   # per-CTA shared-memory cap
+_BYTES_PER_ELEM = 2              # bf16/fp16
+_MIN_C_COLS = 64                 # narrowest C_shared chunk the split-N epilogue stages
+
+
+def _coop_ring_smem_bytes(num_stages, half_m, block_n, block_k):
+    """Cooperative-template main K-ring SMEM: 2×A_smem(half_m) + 1×B_smem."""
+    return num_stages * (2 * half_m + block_n) * block_k * _BYTES_PER_ELEM
+
+
 _DEFAULT_CONFIG = {
     "block_m": 128,        # cooperative template (split-A, shared-B)
     "block_n": 256,
     "block_k": 64,
-    "num_stages": 3,
+    # ns=4 is the deepest K-ring that fits the SMEM cap at bn=256 once the
+    # epilogue stages C in c_split N-column chunks (see _make_cooperative_kernel):
+    # ns=4 beats ns=3 uniformly across per-expert M (largest at small M); ns=5's
+    # ring alone overflows SMEM, so this is the depth ceiling for the high-reuse
+    # bn=256 tile. Deeper depth only pays WITH the group_size_m swizzle keeping
+    # the L2 B-working-set tight; at gsm=1 a 4th stage thrashes L2 and craters.
+    "num_stages": 4,
     "threads": 384,
     # Threadblock swizzle: group this many consecutive m-tiles so concurrent
     # CTAs in a wave share B[e] columns in L2. 8 is the robust Triton-standard
     # default (~5% over 1 on compute-bound MoE shapes); autotune sweeps it.
     "group_size_m": 8,
+    # N-dimension swizzle width: sub-block each m-band into group_size_n n-tile
+    # columns so a wave's L2 working set is a 2D (group_size_m × group_size_n)
+    # tile-block instead of (group_size_m × all-N). 0 (or any value not dividing
+    # num_pid_n) means "full N band" — the plain M-only swizzle, unchanged.
+    "group_size_n": 0,
 }
 
 
@@ -110,6 +135,19 @@ class GroupedGemmPersistent3WGKernel(Kernel):
         def _bench_forward():
             return self.forward(A_dummy, B_dummy, sizes, offsets)
 
+        # Ramp the SM clock to its sustained state before timing configs, else
+        # tiny shapes (numel ~ num_experts) are ranked at idle clock and template
+        # selection gets noisy. fp32: this env's bf16 torch.matmul raises
+        # CUBLAS_STATUS_INVALID_VALUE.
+        _wa = torch.randn(4096, 4096, dtype=torch.float32, device="cuda")
+        _wb = torch.randn(4096, 4096, dtype=torch.float32, device="cuda")
+        _t0 = time.perf_counter()
+        while time.perf_counter() - _t0 < 2.0:
+            for _ in range(16):
+                _wa = _wa @ _wb
+            torch.cuda.synchronize()
+        del _wa, _wb
+
         for cfg in self.autotune_configs:
             try:
                 self.config = cfg
@@ -129,13 +167,22 @@ class GroupedGemmPersistent3WGKernel(Kernel):
 
     @property
     def autotune_configs(self) -> list[dict]:
-        SMEM_LIMIT = 228 * 1024
-        bytes_per_elem = 2  # bf16/fp16
+        SMEM_LIMIT = _SMEM_LIMIT_BYTES
+        bytes_per_elem = _BYTES_PER_ELEM
         configs = []
+        # Prune the config space by the block_m >= per-expert-M rule: pingpong
+        # (bm=64) is the small-M template, cooperative (bm=128) the large-M one.
+        # Dropping the losing template at the extremes makes autotune both faster
+        # and robust against noisy config selection at tiny shapes (where the
+        # per-config benchmark signal is weak). The 64..128 band keeps both so the
+        # autotuner resolves the genuine crossover.
+        per_m = max(1, self.numel // self.num_experts)
+        _pp_bm = (64,) if per_m <= 128 else ()
+        _coop_bm = (128,) if per_m >= 64 else ()
         # ── Pingpong template (bm <= 64): 4 SMEM streams (A_wg0/1, B_wg0/1) ──
-        for block_m in (64,):
+        for block_m in _pp_bm:
             for block_n in (128, 256):
-                for block_k in (64,):
+                for block_k in (64, 128):
                     for num_stages in (2, 3, 4, 5, 6):
                         # 2 × A_smem_wgX (ns, bm, bk) + 2 × B_smem_wgX (ns, bn, bk).
                         smem_main = (
@@ -155,28 +202,41 @@ class GroupedGemmPersistent3WGKernel(Kernel):
         # SMEM: 2 × A_smem (ns, bm/2, bk) + 1 × B_smem (ns, bn, bk).
         # Same total A footprint as pingpong, but the duplicated B ring is
         # eliminated, freeing budget for bn=256 with ns=3 at bm=128.
-        for block_m in (128,):
+        for block_m in _coop_bm:
             half_m = block_m // 2
             for block_n in (128, 256):
-                for block_k in (64,):
+                for block_k in (64, 128):
                     for num_stages in (2, 3, 4, 5, 6):
-                        # 2 × A_smem_{top,bot} (ns, half_m, bk) + 1 × B_smem.
-                        smem_main = (
-                            2 * num_stages * half_m * block_k * bytes_per_elem
-                            + num_stages * block_n * block_k * bytes_per_elem
-                        )
-                        # Per-WG C_shared (half_m, bn) for TMA-store epilogue.
-                        smem_c = 2 * half_m * block_n * bytes_per_elem
-                        if smem_main + smem_c > SMEM_LIMIT:
+                        smem_main = _coop_ring_smem_bytes(
+                            num_stages, half_m, block_n, block_k)
+                        # Per-WG C_shared for the TMA-store epilogue. The
+                        # epilogue stages C in c_split N-column chunks (see
+                        # _make_cooperative_kernel), so the binding footprint is
+                        # the minimal chunk (_MIN_C_COLS), not the full bn. This
+                        # is what admits ns=4 at bn=256 (whole-tile staging would
+                        # prune it); ns=5's ring alone still overflows.
+                        smem_c_min = (
+                            2 * half_m * min(block_n, _MIN_C_COLS) * bytes_per_elem)
+                        if smem_main + smem_c_min > SMEM_LIMIT:
                             continue
-                        # Threadblock swizzle width: larger groups give more L2
-                        # B-column reuse but saturate near num_pid_m per expert.
+                        # Threadblock swizzle: group_size_m sets the M-band width
+                        # (L2 B-column reuse); group_size_n sub-blocks each band
+                        # along N into a 2D (gm × gn) tile-block, bounding the
+                        # per-wave L2 working set. gn=0 is the M-only map (best on
+                        # compute-bound shapes, where it's measurably speed-neutral
+                        # but the deeper 2D variants improve L2 hit / cut DRAM —
+                        # the win surfaces only when a shape is memory-bound). The
+                        # autotuner ranks by measured time, so it self-selects gn=0
+                        # on compute-bound shapes and gn>0 on memory-bound ones.
                         for group_size_m in (1, 4, 8, 16):
-                            configs.append({
-                                "block_m": block_m, "block_n": block_n,
-                                "block_k": block_k, "num_stages": num_stages,
-                                "threads": 384, "group_size_m": group_size_m,
-                            })
+                            for group_size_n in (0, 4):
+                                configs.append({
+                                    "block_m": block_m, "block_n": block_n,
+                                    "block_k": block_k, "num_stages": num_stages,
+                                    "threads": 384,
+                                    "group_size_m": group_size_m,
+                                    "group_size_n": group_size_n,
+                                })
         return configs
 
     def forward(self, A, B, true_sizes, true_offsets, out=None):
@@ -256,6 +316,7 @@ class GroupedGemmPersistent3WGKernel(Kernel):
             self.config["num_stages"],
             self.config["threads"],
             self.config.get("group_size_m", 1),
+            self.config.get("group_size_n", 0),
         )
         gemm_fn(A, B, true_sizes, true_offsets, C)
         return C
@@ -263,7 +324,7 @@ class GroupedGemmPersistent3WGKernel(Kernel):
 
 def _make_pingpong_kernel(numel, num_experts, N, K, dtype, sm_count,
                           block_m, block_n, block_k, num_stages, threads,
-                          group_size_m):
+                          group_size_m, group_size_n=0):
     """Build a @T.prim_func for the pingpong template (block_m <= 64).
 
     Two math WGs each work an independent tile per wave; each WG holds
@@ -632,7 +693,7 @@ def _make_pingpong_kernel(numel, num_experts, N, K, dtype, sm_count,
 
 def _make_cooperative_kernel(numel, num_experts, N, K, dtype, sm_count,
                              block_m, block_n, block_k, num_stages, threads,
-                             group_size_m):
+                             group_size_m, group_size_n=0):
     """Build a @T.prim_func for the cooperative template (block_m >= 128).
 
     Both math WGs split the M dimension of one shared tile in half.
@@ -680,6 +741,25 @@ def _make_cooperative_kernel(numel, num_experts, N, K, dtype, sm_count,
     _k_iters = K // block_k
     A_shape = (numel, K)  # TMA zero-fills OOB last-tile rows; epilogue masks them
 
+    # ── Epilogue C-staging column split (latency-hiding lever) ──
+    # The TMA-store fast path stages a (half_m, block_n) half-tile in SMEM. At
+    # bn=256 that costs 2×(half_m·bn)·2B = 64 KiB, which pins num_stages at 3 (a
+    # 4th K-stage ring overflows the SMEM cap). Pipeline depth is the dominant
+    # latency-hiding lever, so we stage the epilogue in ``c_split`` N-column
+    # chunks of (half_m, bn/c_split) instead, TMA-storing each chunk in turn.
+    # This frees enough SMEM to admit ns=4 at bn=256 while keeping the high-reuse
+    # bn=256 tile shape. c_split is chosen at build time as the smallest
+    # power-of-two that fits the K-ring; the legacy ns=3/bn=256 default keeps
+    # c_split=1 (whole-tile store, no change).
+    _smem_main = _coop_ring_smem_bytes(num_stages, half_m, block_n, block_k)
+    c_split = 1
+    while (_smem_main + 2 * half_m * (block_n // c_split) * _BYTES_PER_ELEM
+           > _SMEM_LIMIT_BYTES
+           and (block_n // c_split) % _MIN_C_COLS == 0
+           and block_n // (c_split * 2) >= _MIN_C_COLS):
+        c_split *= 2
+    _c_cols = block_n // c_split
+
     # Threadblock-swizzle tile decode, shared by the producer and both math WGs
     # (identical in all three, so factored out to keep them in lock-step).
     # Groups ``group_size_m`` consecutive m-tiles so the ``sm_count`` consecutive
@@ -695,17 +775,35 @@ def _make_cooperative_kernel(numel, num_experts, N, K, dtype, sm_count,
     # runtime-remainder branch. The result is staged in ``swz_m``/``swz_n``
     # because TileLang forbids reading a Var defined inside an IfFrame outside it
     # (Buffer loads are exempt).
+    #
+    # 2D swizzle: each m-band (group_size_m rows × all N cols) is additionally
+    # sub-blocked into ``_gn`` n-tile-wide strips, so the wave's L2 working set
+    # is a (group_size_m × _gn) tile-block. ``_gn`` must divide ``_num_pid_n``;
+    # ``_gn == _num_pid_n`` (the default when group_size_n is 0 or non-dividing)
+    # collapses the 2D map back to the plain M-only swizzle bit-for-bit.
+    _gn = (group_size_n if (group_size_n and _num_pid_n % group_size_n == 0)
+           else _num_pid_n)
+
     @T.macro
     def _swizzle_decode(flat_id, s_cum, swz_m, swz_n):
         _gin = T.int32(group_size_m * _num_pid_n)
         _fpm = (flat_id // _gin) * T.int32(group_size_m)
+        _rem = flat_id % _gin
         if s_cum[num_experts] - _fpm >= T.int32(group_size_m):
-            swz_m[0] = _fpm + (flat_id % _gin) % T.int32(group_size_m)
-            swz_n[0] = (flat_id % _gin) // T.int32(group_size_m)
+            # Full m-band: gm × _gn super-tiles, m fastest within each.
+            _blk = T.int32(group_size_m * _gn)
+            _sb = _rem // _blk
+            _lid = _rem % _blk
+            swz_m[0] = _fpm + _lid % T.int32(group_size_m)
+            swz_n[0] = _sb * T.int32(_gn) + _lid // T.int32(group_size_m)
         else:
-            _gsm = s_cum[num_experts] - _fpm
-            swz_m[0] = _fpm + (flat_id % _gin) % _gsm
-            swz_n[0] = (flat_id % _gin) // _gsm
+            # Tail m-band: msz (< gm) rows, same _gn N sub-blocking.
+            _msz = s_cum[num_experts] - _fpm
+            _blk = _msz * T.int32(_gn)
+            _sb = _rem // _blk
+            _lid = _rem % _blk
+            swz_m[0] = _fpm + _lid % _msz
+            swz_n[0] = _sb * T.int32(_gn) + _lid // _msz
 
     @T.prim_func
     def _gemm_main_v2_coop(
@@ -725,10 +823,13 @@ def _make_cooperative_kernel(numel, num_experts, N, K, dtype, sm_count,
             C_local_wg1 = T.alloc_fragment((half_m, block_n), accum_dtype)
 
             # ── TMA-store epilogue staging (per-WG half-tile) ──
+            # C_shared is only ``_c_cols`` (= block_n / c_split) wide: the store
+            # walks the half-tile in c_split N-column chunks, freeing SMEM for a
+            # deeper K-ring (see _c_cols computation above).
             C_local_cast_wg0 = T.alloc_fragment((half_m, block_n), dtype)
             C_local_cast_wg1 = T.alloc_fragment((half_m, block_n), dtype)
-            C_shared_wg0 = T.alloc_shared((half_m, block_n), dtype)
-            C_shared_wg1 = T.alloc_shared((half_m, block_n), dtype)
+            C_shared_wg0 = T.alloc_shared((half_m, _c_cols), dtype)
+            C_shared_wg1 = T.alloc_shared((half_m, _c_cols), dtype)
 
             # ── Scheduler SMEM (single tile per wave; one binary search) ──
             s_cum = T.alloc_shared((num_experts + 1,), "int32")
@@ -911,20 +1012,28 @@ def _make_cooperative_kernel(numel, num_experts, N, K, dtype, sm_count,
                         # ── Epilogue (top half) ──
                         T.copy(C_local_wg0, C_local_cast_wg0)
                         if arows0 == T.int32(half_m):
-                            # Fast path: full top-half tile via TMA store.
-                            # WG-scoped named barrier guards C_shared reuse across
-                            # waves; see the pingpong WG0 epilogue for the full
-                            # rationale (and why a CTA-wide sync would deadlock).
-                            T.sync_threads(barrier_id=4, arrive_count=128)
-                            T.copy(C_local_cast_wg0, C_shared_wg0)
-                            # Order the generic-proxy SMEM writes above before
-                            # the async-proxy TMA read below, and align all 128
-                            # WG0 threads so the TMA store never reads a
-                            # half-written C_shared (intra-wave write→read race).
-                            T.fence_proxy_async()
-                            T.sync_threads(barrier_id=4, arrive_count=128)
-                            T.copy(C_shared_wg0,
-                                   C[m_start, n_start])
+                            # Fast path: full top-half tile via TMA store, walked
+                            # in c_split N-column chunks of _c_cols each (the
+                            # shared C_shared is only _c_cols wide). c_split=1 is
+                            # the legacy whole-tile store.
+                            for _cj in range(c_split):  # compile-time unroll
+                                _ncol = T.int32(_cj * _c_cols)
+                                # WG-scoped named barrier guards C_shared reuse
+                                # across chunks AND waves; see the pingpong WG0
+                                # epilogue for why a CTA-wide sync would deadlock.
+                                T.sync_threads(barrier_id=4, arrive_count=128)
+                                T.copy(
+                                    C_local_cast_wg0[:, _cj * _c_cols:
+                                                     _cj * _c_cols + _c_cols],
+                                    C_shared_wg0)
+                                # Order the generic-proxy SMEM writes above before
+                                # the async-proxy TMA read below, and align all 128
+                                # WG0 threads so the TMA store never reads a
+                                # half-written C_shared (intra-wave write→read race).
+                                T.fence_proxy_async()
+                                T.sync_threads(barrier_id=4, arrive_count=128)
+                                T.copy(C_shared_wg0,
+                                       C[m_start, n_start + _ncol])
                         else:
                             # Slow path: predicated direct STG (rows 0..arows0).
                             for i, j in T.Parallel(half_m, block_n):
@@ -995,17 +1104,23 @@ def _make_cooperative_kernel(numel, num_experts, N, K, dtype, sm_count,
                         # ── Epilogue (bottom half) ──
                         T.copy(C_local_wg1, C_local_cast_wg1)
                         if arows1 == T.int32(half_m):
-                            # Fast path: full bottom-half tile via TMA store.
-                            # Same C_shared reuse ordering as the top half, on WG1's
+                            # Fast path: full bottom-half tile via TMA store,
+                            # walked in c_split N-column chunks (see WG0). Same
+                            # C_shared reuse ordering as the top half, on WG1's
                             # own named barrier (id=5).
-                            T.sync_threads(barrier_id=5, arrive_count=128)
-                            T.copy(C_local_cast_wg1, C_shared_wg1)
-                            # See the top-half epilogue: fence + WG barrier order
-                            # the SMEM writes before the async TMA read.
-                            T.fence_proxy_async()
-                            T.sync_threads(barrier_id=5, arrive_count=128)
-                            T.copy(C_shared_wg1,
-                                   C[m_start + half_m, n_start])
+                            for _cj in range(c_split):  # compile-time unroll
+                                _ncol = T.int32(_cj * _c_cols)
+                                T.sync_threads(barrier_id=5, arrive_count=128)
+                                T.copy(
+                                    C_local_cast_wg1[:, _cj * _c_cols:
+                                                     _cj * _c_cols + _c_cols],
+                                    C_shared_wg1)
+                                # See the top-half epilogue: fence + WG barrier
+                                # order the SMEM writes before the async TMA read.
+                                T.fence_proxy_async()
+                                T.sync_threads(barrier_id=5, arrive_count=128)
+                                T.copy(C_shared_wg1,
+                                       C[m_start + half_m, n_start + _ncol])
                         elif arows1 > T.int32(0):
                             # Slow path: predicated direct STG.
                             for i, j in T.Parallel(half_m, block_n):
@@ -1041,16 +1156,19 @@ def _persistent_grouped_gemm_v2_kernel(numel, num_experts, N, K, dtype,
         },
         compile_flags=["-O3", "-DENABLE_BF16", "-include", _ANCHOR_HELPER_PATH],
     )
-    def _func(block_m, block_n, block_k, num_stages, threads, group_size_m):
+    def _func(block_m, block_n, block_k, num_stages, threads, group_size_m,
+              group_size_n):
         if block_m <= 64:
             return _make_pingpong_kernel(
                 numel, num_experts, N, K, dtype, sm_count,
                 block_m, block_n, block_k, num_stages, threads, group_size_m,
+                group_size_n,
             )
         else:
             return _make_cooperative_kernel(
                 numel, num_experts, N, K, dtype, sm_count,
                 block_m, block_n, block_k, num_stages, threads, group_size_m,
+                group_size_n,
             )
 
     return _func

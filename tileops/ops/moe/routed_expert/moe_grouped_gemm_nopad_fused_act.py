@@ -45,6 +45,7 @@ class MoeGroupedGemmNopad3WGFusedActFwdOp(Op):
         dtype: torch.dtype = torch.bfloat16,
         activation: str = "silu_and_mul",
         kernel_map: Optional[Dict[str, Kernel]] = None,
+        config: Optional[Dict] = None,
         tune: bool = False,
     ) -> None:
         self.numel = numel
@@ -55,7 +56,8 @@ class MoeGroupedGemmNopad3WGFusedActFwdOp(Op):
         self.activation = activation
         self.dispatch_kernel(kernel_map)
         self.kernel = self.kernel_map["moe_grouped_gemm_fused_act_kernel"](
-            numel, num_experts, ffn, k, dtype=dtype, activation=activation, tune=tune)
+            numel, num_experts, ffn, k, dtype=dtype, activation=activation,
+            config=config, tune=tune)
 
     @property
     def default_kernel_map(self) -> Dict[str, Kernel]:

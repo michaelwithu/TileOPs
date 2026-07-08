@@ -44,6 +44,7 @@ class MoeGroupedGemmNopadFwdOp(Op):
         k: int,
         dtype: torch.dtype = torch.bfloat16,
         kernel_map: Optional[Dict[str, Kernel]] = None,
+        config: Optional[Dict] = None,
         tune: bool = False,
     ) -> None:
         self.numel = numel
@@ -54,7 +55,7 @@ class MoeGroupedGemmNopadFwdOp(Op):
 
         self.dispatch_kernel(kernel_map)
         self.kernel = self.kernel_map["moe_grouped_gemm_kernel"](
-            numel, num_experts, n, k, dtype=dtype, tune=tune
+            numel, num_experts, n, k, dtype=dtype, config=config, tune=tune
         )
 
     @property

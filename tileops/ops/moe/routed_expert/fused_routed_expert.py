@@ -42,6 +42,30 @@ __all__ = [
 _logger = logging.getLogger(__name__)
 
 
+def _select_gemm_config(per_m, N, K):
+    """Pick the 3WG grouped-GEMM tiling for a given per-expert M.
+
+    Distilled from an offline autotune sweep over the 3WG config space (up and
+    down GEMMs, per-expert M from 1 to 1024):
+
+    - per_m <= 64 (memory-bound) -> pingpong (block_m=64). block_k=128 lifts
+      DRAM throughput (larger TMA bursts) and wins at K >= 2048; K <= 1024 falls
+      back to block_k=64 / ns=3 (short K has too few K-iters for ns=2). The
+      single K threshold is a deliberate simplification of the per-shape table
+      (a rare short up-GEMM gets block_k=128 over a marginal block_k=64 — still
+      correct, slightly slower).
+    - per_m >= 128 (compute-bound) -> cooperative; the kernel's _DEFAULT_CONFIG
+      is the autotune winner there, so return None to use the kernel default.
+
+    Returns None to fall through to the kernel default (cooperative).
+    """
+    if per_m > 64:
+        return None
+    bk = 64 if K <= 1024 else 128
+    return {"block_m": 64, "block_n": 128, "block_k": bk,
+            "num_stages": 3 if bk == 64 else 2, "threads": 384, "group_size_m": 1}
+
+
 class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
     """Expert GEMM using tight (T*K rows, no-pad) layout with 3WG persistent kernel.
 
@@ -181,6 +205,20 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
                 )
                 self.use_fused_activation = False
 
+        # Per-expert-M-driven tiling: pick pingpong (small M) vs cooperative
+        # (large M) per GEMM from the offline autotune table. Only when the 3WG
+        # kernel is actually selected — the nopad fallback kernel does not accept
+        # these configs. gate_up and down have different (N, K) -> select each.
+        # per_m uses num_experts_local (the count the GEMM is built with) so the
+        # template choice matches the per-expert M the kernel actually tiles
+        # under expert parallelism; for single-GPU it equals num_experts.
+        per_m = numel // max(1, num_experts_local)
+        if kernel_cls is GroupedGemmPersistent3WGKernel:
+            gate_up_config = _select_gemm_config(per_m, gate_up_n, hidden_size)
+            down_config = _select_gemm_config(per_m, hidden_size, ffn_size)
+        else:
+            gate_up_config = down_config = None
+
         self._permute = MoePermuteNopadFwdOp(
             num_experts=num_experts, dtype=dtype, expert_map=expert_map,
             kernel_map=kernel_map,
@@ -190,6 +228,9 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
             from .moe_grouped_gemm_nopad_fused_act import (
                 MoeGroupedGemmNopad3WGFusedActFwdOp,
             )
+            # The fused gate_up keeps its own kernel default tiling; the per_m
+            # config seam is applied to the unfused gate_up + down path. (The
+            # fused-act kernel's config space differs; tuning it is a follow-up.)
             self._gemm_gate_up = MoeGroupedGemmNopad3WGFusedActFwdOp(
                 numel=numel, num_experts=num_experts_local,
                 ffn=ffn_size, k=hidden_size, dtype=dtype, activation=activation,
@@ -201,6 +242,7 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
                 numel=numel, num_experts=num_experts_local,
                 n=ffn_size * 2, k=hidden_size, dtype=dtype,
                 kernel_map={"moe_grouped_gemm_kernel": kernel_cls, **(kernel_map or {})},
+                config=gate_up_config,
             )
             self._activation_op = build_activation_op(
                 activation, M=numel, N=ffn_size, dtype=dtype, kernel_map=kernel_map,
@@ -209,6 +251,7 @@ class FusedMoEExpertsNopadPersistent3WGFwdOp(FusedMoEExpertsModular):
             numel=numel, num_experts=num_experts_local,
             n=hidden_size, k=ffn_size, dtype=dtype,
             kernel_map={"moe_grouped_gemm_kernel": kernel_cls, **(kernel_map or {})},
+            config=down_config,
         )
         self._unpermute = MoeUnpermuteFwdOp(
             total_tokens=num_tokens, top_k=top_k,
