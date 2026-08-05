@@ -1,9 +1,16 @@
 import gc
+import json
+import os
 
 import pytest
 import torch
 
-from benchmarks.benchmark_base import BenchmarkReport, _bench_results
+from benchmarks.benchmark_base import (
+    BenchmarkReport,
+    _begin_case_profiler_session,
+    _bench_results,
+    _finish_case_profiler_session,
+)
 
 # Skip NSA benchmarks until the underlying op failures are resolved.
 collect_ignore_glob = [
@@ -45,7 +52,7 @@ def pytest_sessionstart(session):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    BenchmarkReport.dump("profile_run.log")
+    BenchmarkReport.dump(os.environ.get("TILEOPS_BENCH_PROFILE_PATH", "profile_run.log"))
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -72,11 +79,42 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 def pytest_runtest_call(item):
     """After bench test execution, attach perf data to the item as properties."""
     _bench_results.entries = []
+    _begin_case_profiler_session()
     try:
         yield
+        health = _finish_case_profiler_session()
+        if health is not None:
+            health |= {
+                "nodeid": _normalized_benchmark_nodeid(item),
+                "worker_id": os.environ.get("TILEOPS_BENCH_WORKER_ID", ""),
+                "process_case_index": int(
+                    os.environ.get("TILEOPS_BENCH_PROCESS_CASE_INDEX", "0")
+                ),
+            }
+            health_path = os.environ.get("TILEOPS_BENCH_HEALTH_PATH")
+            if health_path:
+                with open(health_path, "w") as stream:
+                    json.dump(health, stream)
+            for key, value in health.items():
+                item.user_properties.append((f"kineto_health_{key}", value))
+            if not health["healthy"]:
+                pytest.fail(
+                    f"Kineto health check failed: {health['reason']} "
+                    f"(start cpu/kernel/gpu="
+                    f"{health['start_cpu_count']}/{health['start_kernel_count']}/"
+                    f"{health['start_gpu_annotation_count']}, end="
+                    f"{health['end_cpu_count']}/{health['end_kernel_count']}/"
+                    f"{health['end_gpu_annotation_count']})"
+                )
         entries = getattr(_bench_results, "entries", [])
         if not entries:
             return
+
+        entries = [
+            {key: value for key, value in entry.items() if key != "result"}
+            | entry["result"]
+            for entry in entries
+        ]
 
         # Separate tileops entry (tag starts with "tileops") from baselines.
         tileops_entry = None
@@ -97,6 +135,16 @@ def pytest_runtest_call(item):
                 item.user_properties.append(("tileops_variant", tag[len("tileops_"):]))
             item.user_properties.append(("tileops_latency_ms",
                                          f"{tileops_entry.get('latency_ms', 0):.4f}"))
+            item.user_properties.append((
+                "tileops_timing_source",
+                tileops_entry.get("timing_source", "unknown"),
+            ))
+            for key in (
+                "fallback_reason", "expected_region_count",
+                "observed_region_counts", "kineto_error",
+            ):
+                if key in tileops_entry:
+                    item.user_properties.append((f"tileops_{key}", tileops_entry[key]))
             tflops = tileops_entry.get("tflops")
             if tflops is not None:
                 item.user_properties.append(("tileops_tflops", f"{tflops:.2f}"))
@@ -117,6 +165,10 @@ def pytest_runtest_call(item):
                 # Legacy unprefixed keys — consumed by existing nightly_report.py
                 item.user_properties.append(("baseline_tag", tag))
                 item.user_properties.append(("baseline_latency_ms", f"{bl_latency:.4f}"))
+                item.user_properties.append((
+                    "baseline_timing_source",
+                    be.get("timing_source", "unknown"),
+                ))
                 if bl_tflops is not None:
                     item.user_properties.append(("baseline_tflops", f"{bl_tflops:.2f}"))
                 if tileops_entry:
@@ -127,6 +179,16 @@ def pytest_runtest_call(item):
 
             # Tag-prefixed keys — always written for every baseline
             item.user_properties.append((f"{tag}_latency_ms", f"{bl_latency:.4f}"))
+            item.user_properties.append((
+                f"{tag}_timing_source",
+                be.get("timing_source", "unknown"),
+            ))
+            for key in (
+                "fallback_reason", "expected_region_count",
+                "observed_region_counts", "kineto_error",
+            ):
+                if key in be:
+                    item.user_properties.append((f"{tag}_{key}", be[key]))
             if bl_tflops is not None:
                 item.user_properties.append((f"{tag}_tflops", f"{bl_tflops:.2f}"))
             if tileops_entry:
@@ -134,5 +196,7 @@ def pytest_runtest_call(item):
                 if tl > 0 and bl_latency > 0:
                     item.user_properties.append((f"{tag}_ratio", f"{bl_latency / tl:.4f}"))
     finally:
+        # Also clears a partially registered session when the test body fails.
+        _bench_results.case_profiler = None
         _bench_results.entries = []
         _release_cuda_cache_after_case()

@@ -208,7 +208,6 @@ def test_gated_deltanet_prefill_fwd_bench(
     if fla_fn is not None:
         fla_inputs = convert_gdn_prefill_layout(inputs, layout, "bthd")
         result_fla = bm.profile(fla_fn, *fla_inputs)
-        result["speedup_vs_fla"] = result_fla["latency_ms"] / result["latency_ms"]
         BenchmarkReport.record(op, locals(), result, tag="tileops")
         BenchmarkReport.record(op, locals(), result_fla, tag="fla")
     else:

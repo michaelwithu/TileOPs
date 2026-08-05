@@ -9,11 +9,11 @@ world-size-one reference.
 import argparse
 
 import torch
-from _moe_bench_utils import (
+
+from benchmarks.ops._moe_bench_utils import (
     make_routing_inputs,
     measure_dispatch,
 )
-
 from tileops.ops.moe import LocalExpertDispatcher
 
 WARMUP = 20

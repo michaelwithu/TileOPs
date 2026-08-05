@@ -108,9 +108,9 @@ def parse_bench_xml(path: str) -> list[dict]:
         }
         # Perf data
         for key in ("tileops_latency_ms", "tileops_tflops", "tileops_bandwidth_tbs",
-                     "tileops_variant",
+                     "tileops_variant", "tileops_timing_source",
                      "baseline_tag", "baseline_latency_ms", "baseline_tflops",
-                     "baseline_ratio"):
+                     "baseline_ratio", "baseline_timing_source"):
             if key in props:
                 try:
                     entry[key] = float(props[key])

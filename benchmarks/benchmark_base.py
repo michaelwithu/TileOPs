@@ -2,6 +2,7 @@ import logging
 import subprocess
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime
 from typing import (
     Any,
@@ -84,12 +85,131 @@ _logger = logging.getLogger("tileops.bench")
 _bench_results = threading.local()
 
 
-# Name of the ``record_function`` annotation wrapping the timed call. Kineto
-# projects this scope onto the device timeline. The L2-flush ``cache.zero_()``
-# is synchronized to completion before the window opens (see ``bench_kernel``),
-# so its device event cannot fall inside a window regardless of how the
-# projection behaves; kernels the timed call launches do.
+@dataclass
+class _PendingMeasurement:
+    fn: Callable
+    args: tuple[Any, ...]
+    n_warmup: int
+    n_repeat: int
+    n_trials: int
+    result: dict
+    build_result: Callable[[float], dict]
+    enable_grad: bool = False
+    fallback_latency_ms: Optional[float] = None
+
+
+class _CaseProfilerSession:
+    """Execute measurements immediately inside one case-wide Kineto session."""
+
+    def __init__(self) -> None:
+        self.measurements: list[_PendingMeasurement] = []
+        self.profiler = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+        )
+        self.profiler.__enter__()
+        self.canary = torch.zeros(1024, device="cuda")
+        self.canary.add_(1)
+        torch.cuda.synchronize()
+        self._run_canary(_CANARY_START_REGION)
+
+    def add(self, measurement: _PendingMeasurement) -> dict:
+        """Run one request now; its CUPTI result is parsed when the case ends."""
+        measurement_index = len(self.measurements)
+        self.measurements.append(measurement)
+        try:
+            run, arg_pool = _prepare_measurement_runner(measurement)
+            cache = _get_l2_flush_cache()
+            event_trial_means = []
+            for trial_index in range(measurement.n_trials):
+                region = f"{_KERNEL_REGION}:{measurement_index}:{trial_index}"
+                starts = [
+                    torch.cuda.Event(enable_timing=True)
+                    for _ in range(measurement.n_repeat)
+                ]
+                ends = [
+                    torch.cuda.Event(enable_timing=True)
+                    for _ in range(measurement.n_repeat)
+                ]
+                for repeat_index in range(measurement.n_repeat):
+                    cache.zero_()
+                    torch.cuda.synchronize()
+                    starts[repeat_index].record()
+                    with torch.profiler.record_function(region):
+                        run(repeat_index)
+                        torch.cuda.synchronize()
+                    ends[repeat_index].record()
+                torch.cuda.synchronize()
+                times = [
+                    start.elapsed_time(end)
+                    for start, end in zip(starts, ends, strict=True)
+                ]
+                event_trial_means.append(sum(times) / len(times))
+            if arg_pool is not None:
+                del arg_pool
+        except BaseException:
+            # The synchronous profile contract requires the caller to observe
+            # setup/kernel exceptions at this call site.  Do not leave a
+            # half-recorded request for teardown to process and mask that
+            # original exception (notably pytest.skip for unsupported shapes).
+            self.measurements.pop()
+            raise
+        event_trial_means.sort()
+        measurement.fallback_latency_ms = event_trial_means[len(event_trial_means) // 2]
+        return measurement.result
+
+    def _run_canary(self, region: str) -> None:
+        for _ in range(_CANARY_REPEATS):
+            with torch.profiler.record_function(region):
+                self.canary.add_(1)
+                torch.cuda.synchronize()
+
+    def finish(self) -> dict[str, Any]:
+        """Close the trace, validate canaries, and fill registered results."""
+        self._run_canary(_CANARY_END_REGION)
+        profiler_error = None
+        try:
+            self.profiler.__exit__(None, None, None)
+            kineto_results = self.profiler.profiler.kineto_results
+        except RuntimeError as error:
+            kineto_results = None
+            profiler_error = f"{type(error).__name__}: {error}"
+        return _parse_case_measurements(
+            self.measurements, kineto_results, profiler_error
+        )
+
+
+def _begin_case_profiler_session() -> None:
+    if getattr(_bench_results, "case_profiler", None) is not None:
+        raise RuntimeError("benchmark case profiler session is already active")
+    _bench_results.case_profiler = _CaseProfilerSession()
+
+
+def _active_case_profiler_session() -> Optional[_CaseProfilerSession]:
+    return getattr(_bench_results, "case_profiler", None)
+
+
+def _finish_case_profiler_session() -> Optional[dict[str, Any]]:
+    session = _active_case_profiler_session()
+    if session is None:
+        return None
+    try:
+        return session.finish()
+    finally:
+        _bench_results.case_profiler = None
+
+
+# Name of the CPU ``record_function`` scope wrapping the timed call.  The L2
+# flush is synchronized before this scope opens, and the measured work is
+# synchronized before it closes.  Consequently its CPU timestamps form a
+# reliable device-work window even when Kineto's projected GPU annotation is
+# incomplete (notably for kernels launched by autograd worker threads).
 _KERNEL_REGION = "tileops_bench_kernel"
+_CANARY_START_REGION = "tileops_bench_canary_start"
+_CANARY_END_REGION = "tileops_bench_canary_end"
+_CANARY_REPEATS = 3
 
 
 def _sum_kernel_time_us(kineto_results):
@@ -104,33 +224,13 @@ def _sum_kernel_time_us(kineto_results):
 
     Returns:
         ``(total_us, n_regions)``: summed kernel time in microseconds and the
-        number of annotation windows. The caller checks ``n_regions ==
-        n_repeat`` to confirm the scope projected on every iteration.
+        number of CPU annotation windows. The caller checks ``n_regions ==
+        n_repeat`` to confirm every timed iteration was recorded.
     """
-    import bisect
-
-    windows: list[tuple[int, int]] = []
-    kernels: list[tuple[int, int]] = []  # (start_ns, duration_ns)
-    for evt in kineto_results.events():
-        if evt.device_type() != DeviceType.CUDA:
-            continue
-        if evt.is_user_annotation():
-            if evt.name() == _KERNEL_REGION:
-                windows.append((evt.start_ns(), evt.end_ns()))
-            continue
-        kernels.append((evt.start_ns(), evt.duration_ns()))
-
-    windows.sort()
-    starts = [w[0] for w in windows]
-    ends = [w[1] for w in windows]
-    total_us = 0.0
-    for start_ns, dur_ns in kernels:
-        # Count only kernels that fall inside a timed-call window; everything
-        # outside (notably the L2-flush fill) is excluded.
-        idx = bisect.bisect_right(starts, start_ns) - 1
-        if idx >= 0 and start_ns < ends[idx]:
-            total_us += dur_ns / 1000.0
-    return total_us, len(windows)
+    total_us, count = _region_kernel_times_us(
+        kineto_results, {_KERNEL_REGION}
+    )[_KERNEL_REGION]
+    return total_us, count
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +370,10 @@ def bench_kernel(
                         torch.cuda.synchronize()
                         with torch.profiler.record_function(_KERNEL_REGION):
                             _run(i)
-                        torch.cuda.synchronize()  # kernel recorded in isolation
+                            # Keep the CPU annotation open until all measured
+                            # device work completes.  GPU annotation projection
+                            # is incomplete for autograd worker-thread launches.
+                            torch.cuda.synchronize()
                 total_us, n_regions = _sum_kernel_time_us(profiler.profiler.kineto_results)
                 # Scope failed to project on some iteration → trace untrustworthy,
                 # fall back to CUDA events.
@@ -302,6 +405,191 @@ def bench_kernel(
 
     trial_means.sort()
     return trial_means[len(trial_means) // 2]
+
+
+def _prepare_measurement_runner(measurement: _PendingMeasurement):
+    """Warm a deferred measurement and return its indexed runner and arg pool."""
+    cache = _get_l2_flush_cache()
+    args = measurement.args
+    has_args = bool(args)
+    arg_pool = None
+    if has_args:
+        tensor_mask = tuple(isinstance(a, torch.Tensor) for a in args)
+        total_bytes = sum(
+            a.nelement() * a.element_size()
+            for a, is_tensor in zip(args, tensor_mask, strict=True)
+            if is_tensor
+        )
+        if total_bytes * 3 <= 1 << 30:
+            arg_pool = [
+                tuple(
+                    a.clone() if is_tensor else a
+                    for a, is_tensor in zip(args, tensor_mask, strict=True)
+                )
+                for _ in range(3)
+            ]
+
+    def run(index: int):
+        call_args = arg_pool[index % len(arg_pool)] if arg_pool else args
+        grad_context = torch.enable_grad() if measurement.enable_grad else torch.no_grad()
+        with grad_context:
+            return measurement.fn(*call_args)
+
+    for i in range(measurement.n_warmup):
+        cache.zero_()
+        run(i)
+    torch.cuda.synchronize()
+    return run, arg_pool
+
+
+def _region_kernel_times_us(kineto_results, region_names: set[str]):
+    """Return CUDA kernel time inside each named CPU annotation window.
+
+    GPU user annotations are projections made by Kineto.  They can cover only
+    the launches performed by the thread that opened ``record_function``; an
+    autograd worker may therefore launch valid kernels outside that projected
+    GPU range.  CPU annotations do not have that limitation.  Callers keep the
+    scope open through ``torch.cuda.synchronize()``, making its timestamps a
+    complete boundary for work launched on every CUDA stream/thread.
+    """
+    stats = _region_kernel_stats(kineto_results, region_names)
+    return {name: (total_us, windows) for name, (total_us, windows, _) in stats.items()}
+
+
+def _region_kernel_stats(kineto_results, region_names: set[str]):
+    """Return kernel time, CPU-window count, and kernel count by region."""
+    import bisect
+
+    windows: dict[str, list[tuple[int, int]]] = {name: [] for name in region_names}
+    kernels: list[tuple[int, int]] = []
+    for event in kineto_results.events():
+        if event.device_type() == DeviceType.CPU and event.is_user_annotation():
+            if event.name() in windows:
+                windows[event.name()].append((event.start_ns(), event.end_ns()))
+            continue
+        if event.device_type() == DeviceType.CUDA and not event.is_user_annotation():
+            kernels.append((event.start_ns(), event.duration_ns()))
+
+    output = {}
+    for name, named_windows in windows.items():
+        named_windows.sort()
+        starts = [window[0] for window in named_windows]
+        ends = [window[1] for window in named_windows]
+        total_us = 0.0
+        kernel_count = 0
+        for start_ns, duration_ns in kernels:
+            index = bisect.bisect_right(starts, start_ns) - 1
+            if index >= 0 and start_ns < ends[index]:
+                total_us += duration_ns / 1000.0
+                kernel_count += 1
+        output[name] = (total_us, len(named_windows), kernel_count)
+    return output
+
+
+def _gpu_annotation_counts(kineto_results, region_names: set[str]) -> dict[str, int]:
+    counts = {name: 0 for name in region_names}
+    for event in kineto_results.events():
+        if (
+            event.device_type() == DeviceType.CUDA
+            and event.is_user_annotation()
+            and event.name() in counts
+        ):
+            counts[event.name()] += 1
+    return counts
+
+
+def _parse_case_measurements(
+    measurements: list[_PendingMeasurement],
+    kineto_results: Any,
+    profiler_error: Optional[str],
+) -> dict[str, Any]:
+    """Parse a closed case trace and fill results without rerunning kernels."""
+    region_names = {
+        f"{_KERNEL_REGION}:{measurement_index}:{trial_index}"
+        for measurement_index, measurement in enumerate(measurements)
+        for trial_index in range(measurement.n_trials)
+    }
+    canary_names = {_CANARY_START_REGION, _CANARY_END_REGION}
+    all_region_names = region_names | canary_names
+    region_results = (
+        _region_kernel_stats(kineto_results, all_region_names)
+        if kineto_results is not None
+        else None
+    )
+    gpu_annotation_counts = (
+        _gpu_annotation_counts(kineto_results, canary_names)
+        if kineto_results is not None
+        else {name: 0 for name in canary_names}
+    )
+
+    health: dict[str, Any] = {
+        "healthy": region_results is not None,
+        "reason": "ok" if region_results is not None else "kineto_runtime_error",
+        "expected": _CANARY_REPEATS,
+    }
+    for position, name in (
+        ("start", _CANARY_START_REGION),
+        ("end", _CANARY_END_REGION),
+    ):
+        _, cpu_count, kernel_count = (
+            region_results[name] if region_results is not None else (0.0, 0, 0)
+        )
+        gpu_count = gpu_annotation_counts[name]
+        health[f"{position}_cpu_count"] = cpu_count
+        health[f"{position}_kernel_count"] = kernel_count
+        health[f"{position}_gpu_annotation_count"] = gpu_count
+        for kind, count in (
+            ("cpu", cpu_count),
+            ("kernel", kernel_count),
+            ("gpu_annotation", gpu_count),
+        ):
+            if health["healthy"] and count != _CANARY_REPEATS:
+                health["healthy"] = False
+                health["reason"] = f"{position}_{kind}_canary_mismatch"
+
+    for measurement_index, measurement in enumerate(measurements):
+        trial_means = []
+        region_counts: list[int] = []
+        fallback_reason = None
+        if region_results is not None:
+            region_counts_match = True
+            for trial_index in range(measurement.n_trials):
+                region = f"{_KERNEL_REGION}:{measurement_index}:{trial_index}"
+                total_us, count, _ = region_results[region]
+                region_counts.append(count)
+                if count != measurement.n_repeat:
+                    region_counts_match = False
+                    if count < measurement.n_repeat:
+                        fallback_reason = "missing_cpu_annotations"
+                    else:
+                        fallback_reason = "duplicate_cpu_annotations"
+                else:
+                    trial_means.append(total_us / measurement.n_repeat * 1e-3)
+            if not region_counts_match:
+                trial_means = []
+        else:
+            fallback_reason = "kineto_runtime_error"
+        if trial_means:
+            trial_means.sort()
+            latency = trial_means[len(trial_means) // 2]
+            timing_source = "cupti"
+        else:
+            latency = measurement.fallback_latency_ms
+            if latency is None:
+                raise RuntimeError("measurement completed without CUDA event timing")
+            timing_source = "cuda_event"
+        built_result = measurement.build_result(latency)
+        built_result["timing_source"] = timing_source
+        built_result["expected_region_count"] = measurement.n_repeat
+        built_result["observed_region_counts"] = "/".join(map(str, region_counts))
+        if fallback_reason is not None:
+            built_result["fallback_reason"] = fallback_reason
+        if profiler_error is not None:
+            built_result["kineto_error"] = profiler_error
+        measurement.result.update(built_result)
+
+    torch.cuda.empty_cache()
+    return health
 
 
 def _get_env_metadata() -> list[str]:
@@ -379,15 +667,35 @@ class BenchmarkBase(Generic[W], ABC):
 
     def profile(self,
                 functor: Any,
-                *inputs: Any) -> dict:
+                *inputs: Any,
+                n_warmup: int = 10,
+                n_repeat: int = 50,
+                n_trials: int = 3) -> dict:
         """Profile a callable and return structured results.
 
         Uses the NVIDIA SOL-ExecBench protocol: CUPTI kernel timing,
         10 warmup, 50 repeats × 3 trials, L2 flush sized to actual
         cache, input tensors cloned each iteration.
         """
+        session = _active_case_profiler_session()
+        if session is not None:
+            return session.add(_PendingMeasurement(
+                fn=functor,
+                args=inputs,
+                n_warmup=n_warmup,
+                n_repeat=n_repeat,
+                n_trials=n_trials,
+                result={},
+                build_result=self._build_result,
+            ))
         with torch.no_grad():
-            latency = bench_kernel(functor, args=inputs)
+            latency = bench_kernel(
+                functor,
+                args=inputs,
+                n_warmup=n_warmup,
+                n_repeat=n_repeat,
+                n_trials=n_trials,
+            )
         return self._build_result(latency)
 
     def profile_autograd(self, functor: Any) -> dict:
@@ -397,6 +705,18 @@ class BenchmarkBase(Generic[W], ABC):
         can build autograd graphs and call .backward() internally.
         The functor must be a zero-arg closure that captures its inputs.
         """
+        session = _active_case_profiler_session()
+        if session is not None:
+            return session.add(_PendingMeasurement(
+                fn=functor,
+                args=(),
+                n_warmup=10,
+                n_repeat=50,
+                n_trials=3,
+                result={},
+                build_result=self._build_result,
+                enable_grad=True,
+            ))
         latency = bench_kernel(functor)
         return self._build_result(latency)
 
@@ -618,15 +938,18 @@ class BenchmarkReport:
         # Accumulate in thread-local for conftest hook.
         if not hasattr(_bench_results, "entries"):
             _bench_results.entries = []
-        entry = {"tag": tag, "op": name, **result}
+        # Keep the result mapping by reference: case-scoped profiling fills it
+        # after the test body has registered every implementation.
+        entry = {"tag": tag, "op": name, "result": result}
         if op_module:
             entry["op_module"] = op_module
         _bench_results.entries.append(entry)
 
-        _logger.info("op=%s module=%s tag=%s latency_ms=%.4f tflops=%.2f",
-                      name, op_module or "N/A", tag,
-                      result.get("latency_ms", 0),
-                      result.get("tflops", 0))
+        if result:
+            _logger.info("op=%s module=%s tag=%s latency_ms=%.4f tflops=%.2f",
+                         name, op_module or "N/A", tag,
+                         result.get("latency_ms", 0),
+                         result.get("tflops", 0))
 
     @staticmethod
     def dump(path: str) -> None:
@@ -679,7 +1002,10 @@ class BenchmarkReport:
                     row = [str(entry["params"].get(k, "")) for k in param_keys]
                     for rk in result_keys:
                         val = entry["result"].get(rk)
-                        row.append(f"{val:.4f}" if val is not None else "N/A")
+                        if isinstance(val, (int, float)):
+                            row.append(f"{val:.4f}")
+                        else:
+                            row.append(str(val) if val is not None else "N/A")
                     if has_config:
                         cfg = entry.get("config")
                         row.append(str(cfg) if cfg else "")

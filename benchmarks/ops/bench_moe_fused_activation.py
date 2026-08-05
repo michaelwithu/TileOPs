@@ -255,7 +255,6 @@ def test_moe_fused_activation_bench(regime: str, num_tokens: int) -> None:
 
     result_torch = bm.profile(_run_torch_ref, hidden, w_gate_up, w_down, topk_weights, topk_ids)
     BenchmarkReport.record(op_unfused, locals(), result_torch, tag="torch-ref")
-    ms_torch = result_torch["latency_ms"]
 
     # ---- Timing: unfused ----------------------------------------------------
     result_unfused = bm.profile(
@@ -264,7 +263,6 @@ def test_moe_fused_activation_bench(regime: str, num_tokens: int) -> None:
     BenchmarkReport.record(
         op_unfused, locals(), result_unfused, tag="tileops-unfused",
     )
-    ms_unfused = result_unfused["latency_ms"]
 
     # ---- Timing: fused ------------------------------------------------------
     result_fused = bm.profile(
@@ -272,17 +270,6 @@ def test_moe_fused_activation_bench(regime: str, num_tokens: int) -> None:
     )
     BenchmarkReport.record(
         op_fused, locals(), result_fused, tag="tileops-fused",
-    )
-    ms_fused = result_fused["latency_ms"]
-
-    # ---- Console summary for this regime ------------------------------------
-    speedup = ms_unfused / ms_fused if ms_fused > 0 else float("nan")
-    note = "  <- fused slower" if speedup < 1.0 else ""
-    print(
-        f"\n[{regime}] num_tokens={num_tokens}"
-        f"  torch-ref={ms_torch:.4f}ms"
-        f"  unfused={ms_unfused:.4f}ms  fused={ms_fused:.4f}ms"
-        f"  speedup(fused/unfused)={speedup:.3f}x{note}"
     )
 
 

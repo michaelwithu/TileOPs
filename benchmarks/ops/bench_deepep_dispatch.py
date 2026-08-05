@@ -15,11 +15,11 @@ import os
 
 import torch
 import torch.distributed as dist
-from _moe_bench_utils import (
+
+from benchmarks.ops._moe_bench_utils import (
     make_routing_inputs,
     measure_dispatch,
 )
-
 from tileops.ops.moe import DeepEPDispatchAdapter
 
 WARMUP = 10

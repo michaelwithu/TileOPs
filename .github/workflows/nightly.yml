@@ -35,7 +35,9 @@ jobs:
   # =========================================================================
   benchmark:
     if: ${{ github.repository == 'tile-ai/TileOPs' && (github.event_name == 'schedule' || github.ref == 'refs/heads/main') }}
-    timeout-minutes: 120
+    # Benchmark cases reuse recyclable workers. Kineto canaries restart a
+    # worker when CUPTI activity/annotation loss is detected.
+    timeout-minutes: 360
     runs-on: [self-hosted, tile-ops, nightly]
     env:
       # Keep the long benchmark suite from fragmenting CUDA allocator segments
@@ -83,7 +85,11 @@ jobs:
 
           set -o pipefail
           python3 -m pip install -q -c constraints.txt pytest-timeout
-          python3 -m pytest -q benchmarks/ops --timeout=900 --timeout-method=thread --junit-xml=bench_results.xml | tee tileops_benchmarks.log
+          python3 scripts/run_benchmark_cases.py benchmarks/ops \
+            --junit-xml=bench_results.xml \
+            --profile-log=profile_run.log \
+            -- --timeout=900 --timeout-method=thread \
+            | tee tileops_benchmarks.log
 
           if [ -f profile_run.log ]; then
             { echo; echo "===== profile_run.log summary ====="; cat profile_run.log; } >> tileops_benchmarks.log

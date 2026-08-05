@@ -1,8 +1,8 @@
 """Dynamic-capacity benchmark for the dispatched expert MLP."""
 
 import torch
-from _moe_bench_utils import cuda_time_ms, effective_tflops
 
+from benchmarks.ops._moe_bench_utils import cuda_time_ms, effective_tflops
 from tileops.ops.moe import DispatchedExpertMLPFwdOp, ExpertBatch
 
 DTYPE = torch.bfloat16

@@ -167,19 +167,6 @@ def test_grouped_gemm_bench(batch_sum: int, batch_count: int, N: int, K: int,
                        dtype, transpose_a, transpose_b, tune)
 
 
-def _combine_results(bm: GroupedGemmCompleteBenchmark, *results: dict) -> dict:
-    """Combine latencies from multiple profiles into a single result."""
-    total_latency = sum(r["latency_ms"] for r in results)
-    combined = {"latency_ms": total_latency}
-    flops = bm.calculate_flops()
-    if flops is not None:
-        combined["tflops"] = flops / total_latency * 1e-9
-    memory = bm.calculate_memory()
-    if memory is not None:
-        combined["bandwidth_gbs"] = memory / total_latency * 1e-9
-    return combined
-
-
 _GROUPED_GEMM_COMPLETE_BENCH_PARAMS = [
     pytest.param(16384, 4, 4864, 4096, torch.float16, True, id="complete-fp16"),
 ]
@@ -202,21 +189,36 @@ def test_grouped_gemm_complete_bench(batch_sum: int, batch_count: int, N: int, K
         (True, False),   # TN
     ]
 
-    tileops_results = []
-    baseline_results = []
+    tileops_ops = []
+    baseline_ops = []
+    variant_inputs = []
     for transpose_a, transpose_b in variants:
         variant_test = _GroupedGemmTestBaseline(batch_sum, batch_count, N, K, dtype,
                                        transpose_a, transpose_b)
         inputs = variant_test.gen_inputs()
         op = GroupedGemmOp(batch_sum, batch_count, N, K, dtype,
                            transpose_a=transpose_a, transpose_b=transpose_b, tune=tune)
-        tileops_results.append(bm.profile(op, *inputs))
-        baseline_results.append(bm.profile(variant_test.ref_program, *inputs))
+        tileops_ops.append(op)
+        baseline_ops.append(variant_test.ref_program)
+        variant_inputs.append(inputs)
 
-    result = _combine_results(bm, *tileops_results)
+    arity = len(variant_inputs[0])
+    if any(len(inputs) != arity for inputs in variant_inputs):
+        raise ValueError("grouped GEMM variants must have the same input arity")
+    flat_inputs = tuple(arg for inputs in variant_inputs for arg in inputs)
+
+    def run_all(ops, *args):
+        for index, variant_op in enumerate(ops):
+            start = index * arity
+            variant_op(*args[start:start + arity])
+
+    # Profile all four variants as one multi-kernel workload.  Besides matching
+    # the advertised complete forward/backward operation, this preserves the
+    # synchronous result API when case-scoped profiling defers measurements.
+    result = bm.profile(lambda *args: run_all(tileops_ops, *args), *flat_inputs)
     BenchmarkReport.record(op, locals(), result, tag="tileops")
 
-    result_bl = _combine_results(bm, *baseline_results)
+    result_bl = bm.profile(lambda *args: run_all(baseline_ops, *args), *flat_inputs)
     BenchmarkReport.record(op, locals(), result_bl, tag="torch-ref")
 
 

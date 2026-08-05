@@ -5,7 +5,8 @@ import argparse
 import deep_gemm
 import torch
 import torch.nn.functional as F
-from _moe_bench_utils import (
+
+from benchmarks.ops._moe_bench_utils import (
     check_output,
     cuda_time_ms,
     effective_tflops,
@@ -13,7 +14,6 @@ from _moe_bench_utils import (
     host_time_ms,
     make_expert_sizes,
 )
-
 from tileops.ops.moe import DispatchedExpertMLPFwdOp
 
 DTYPE = torch.bfloat16
