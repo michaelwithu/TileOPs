@@ -1,8 +1,8 @@
 """FP8 NT GEMM for 1D2D block scales: ``scale_a`` per 1x128, ``scale_b`` per 128x128.
 
 A persistent grid of one producer and two consumer warp-groups: the producer
-fills a shared-memory ring through TMA, each consumer runs WGMMA over 64 of the
-tile's 128 rows and folds every K-step's partial in under its two scales.
+fills a shared-memory ring through TMA, including one M-contiguous ``scale_a``
+column per stage; each consumer folds every K-step's partial under its scales.
 """
 
 import functools
@@ -20,51 +20,197 @@ from tileops.utils import device_calibration, get_sm_count
 __all__ = ["GemmFp81D2DFwdKernel"]
 
 _FP8_1D2D_HELPER_PATH = csrc_path("fp8_1d2d_helper.h")
-
-# K-steps one A-scale staging covers, the most that divides ``ceil(K/128)``: eight fp32
-# of a row-major ``scale_a`` row fill one 32-byte sector, four are TMA's 16-byte unit.
-_SCALE_A_GROUPS = (16, 8, 4)
-# Buffers of the A-scale ring, so one group is written while the other is read.
-_SCALE_A_BUFFERS = 2
-
 _TMA_BFLOAT16 = 9
 _TMA_INTERLEAVE_NONE = 0
-_TMA_SWIZZLE_NONE = 0
+_TMA_SWIZZLE_32B = 1
+_TMA_SWIZZLE_64B = 2
+_TMA_SWIZZLE_128B = 3
 _TMA_L2_128B = 2
 _TMA_OOB_NONE = 0
+_BLOCK_K = 128
+# The driver reserves this much of every block's shared memory
+# (cudaDevAttrReservedSharedMemoryPerBlock).
+_SMEM_RESERVED_PER_BLOCK = 1024
 
-# Schedules measured per (m, n, k), by calibrated board (``tileops.utils.calibration_key``);
-# any other board or shape takes the analytic ``block_n`` band of ``default_config``.
-_FP8_1D2D_CONFIGS: dict[str, dict[tuple[int, int, int], dict[str, object]]] = {
+
+def _dynamic_smem_limit(device_index: Optional[int]) -> int:
+    """Dynamic shared memory one block may claim on the target device, in bytes."""
+    index = torch.cuda.current_device() if device_index is None else device_index
+    props = torch.cuda.get_device_properties(index)
+    return int(props.shared_memory_per_block_optin) - _SMEM_RESERVED_PER_BLOCK
+
+
+def _dynamic_smem_bytes(
+    *,
+    block_m: int,
+    block_n: int,
+    num_stages: int,
+    scale_k: int,
+    scale_b_count: int,
+    shared_epilogue: bool,
+    stage_scale_b_per_k: bool,
+) -> int:
+    """Dynamic shared memory ``main`` allocates for this schedule, in bytes.
+
+    Barriers and the staged B-scale buffer are not dynamic, so neither is counted.
+    """
+    total = num_stages * (block_m + block_n) * _BLOCK_K  # a_shared + b_shared, one byte per element
+    total += num_stages * block_m * 4  # scale_a_shared
+    if shared_epilogue:
+        total += block_m * block_n * 2  # shared_c, bfloat16
+    if not stage_scale_b_per_k:
+        total += scale_b_count * scale_k * 4  # one_scale_b
+    return total
+
+
+_LEGAL_BLOCK_M = (64, 128, 256)
+_LEGAL_BLOCK_N = (16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192)
+
+
+def _validate_schedule(
+    m: int,
+    n: int,
+    k: int,
+    *,
+    block_m: int,
+    block_n: int,
+    num_stages: int,
+    num_sms: int,
+    num_multicast: int,
+    multicast_on_a: bool,
+    group_size_m: int,
+    group_unroll: int,
+    sm_count: int,
+    smem_limit: int,
+    shared_epilogue: bool,
+) -> None:
+    """Answer a configuration before anything is compiled.
+
+    Raises:
+        ValueError: Naming the parameter that cannot be built for this shape.
+    """
+    if block_m not in _LEGAL_BLOCK_M:
+        raise ValueError(f"block_m must be one of {_LEGAL_BLOCK_M}, got {block_m}")
+    if block_n not in _LEGAL_BLOCK_N:
+        raise ValueError(f"block_n must be one of {_LEGAL_BLOCK_N}, got {block_n}")
+    if block_m == 256 and block_n > 128:
+        raise ValueError("block_m=256 requires block_n<=128")
+    if group_size_m < 1:
+        raise ValueError(f"group_size_m must be positive, got {group_size_m}")
+    if group_unroll < 1:
+        raise ValueError(f"group_unroll must be positive, got {group_unroll}")
+    if num_stages < 1:
+        raise ValueError(f"num_stages must be positive, got {num_stages}")
+    if num_sms < 1 or num_sms > sm_count:
+        raise ValueError(f"num_sms must be in [1, {sm_count}], got {num_sms}")
+    if num_multicast not in (1, 2):
+        raise ValueError(f"num_multicast must be 1 or 2, got {num_multicast}")
+    if num_sms % num_multicast:
+        raise ValueError(f"num_sms={num_sms} must be divisible by {num_multicast=}")
+    if num_multicast == 1 and multicast_on_a:
+        raise ValueError("multicast_on_a requires num_multicast=2")
+    if num_multicast == 2 and group_size_m % 2:
+        raise ValueError(f"multicast pairs tiles within a group, so {group_size_m=} must be even")
+
+    num_pid_m = -(-m // block_m)
+    num_pid_n = -(-n // block_n)
+    if num_multicast == 2:
+        multicast_tiles = num_pid_n if multicast_on_a else num_pid_m
+        if multicast_tiles % 2:
+            axis = "N" if multicast_on_a else "M"
+            raise ValueError(f"multicast on {axis} requires an even tile count")
+
+    scale_k = -(-k // _BLOCK_K)
+    worker_count = num_sms // num_multicast
+    max_waves = -(-(num_pid_m * num_pid_n // num_multicast) // worker_count)
+    smem_bytes = _dynamic_smem_bytes(
+        block_m=block_m,
+        block_n=block_n,
+        num_stages=num_stages,
+        scale_k=scale_k,
+        scale_b_count=1 if _BLOCK_K % block_n == 0 else 2,
+        shared_epilogue=shared_epilogue,
+        stage_scale_b_per_k=max_waves > 1 and scale_k < 16,
+    )
+    if smem_bytes > smem_limit:
+        raise ValueError(
+            f"this schedule needs {smem_bytes} bytes of shared memory, over the "
+            f"{smem_limit} a block may claim; lower num_stages={num_stages}, "
+            f"block_m={block_m} or block_n={block_n}"
+        )
+
+
+_FP8_1D2D_CONFIGS: dict[str, dict[tuple[int, int, int], dict[str, int | bool]]] = {
     "h200": {
         (128, 2112, 7168): {
-            "kernel": {"block_n": 16, "num_stages": 8, "group_size_m": 16, "group_unroll": 1},
-            "shared_epilogue": True,
+            "block_m": 64,
+            "block_n": 32,
+            "num_stages": 14,
+            "num_sms": 132,
+            "num_multicast": 1,
+            "multicast_on_a": False,
+            "group_size_m": 16,
+            "group_unroll": 1,
         },
         (128, 7168, 2048): {
-            "kernel": {"block_n": 64, "num_stages": 8, "group_size_m": 16, "group_unroll": 1},
-            "shared_epilogue": True,
-            "sm_count": 112,
+            "block_m": 128,
+            "block_n": 64,
+            "num_stages": 8,
+            "num_sms": 112,
+            "num_multicast": 1,
+            "multicast_on_a": False,
+            "group_size_m": 16,
+            "group_unroll": 1,
         },
         (4096, 2112, 7168): {
-            "kernel": {"block_n": 128, "num_stages": 4, "group_size_m": 16, "group_unroll": 1},
-            "shared_epilogue": True,
+            "block_m": 128,
+            "block_n": 192,
+            "num_stages": 4,
+            "num_sms": 118,
+            "num_multicast": 2,
+            "multicast_on_a": False,
+            "group_size_m": 2,
+            "group_unroll": 1,
         },
         (4096, 4096, 7168): {
-            "kernel": {"block_n": 128, "num_stages": 4, "group_size_m": 16, "group_unroll": 1},
-            "shared_epilogue": True,
+            "block_m": 256,
+            "block_n": 128,
+            "num_stages": 3,
+            "num_sms": 128,
+            "num_multicast": 2,
+            "multicast_on_a": True,
+            "group_size_m": 16,
+            "group_unroll": 1,
         },
         (4096, 7168, 2048): {
-            "kernel": {"block_n": 128, "num_stages": 4, "group_size_m": 32, "group_unroll": 1},
-            "shared_epilogue": True,
+            "block_m": 256,
+            "block_n": 128,
+            "num_stages": 3,
+            "num_sms": 128,
+            "num_multicast": 2,
+            "multicast_on_a": True,
+            "group_size_m": 8,
+            "group_unroll": 3,
         },
         (4096, 7168, 16384): {
-            "kernel": {"block_n": 128, "num_stages": 4, "group_size_m": 16, "group_unroll": 1},
-            "shared_epilogue": False,
+            "block_m": 256,
+            "block_n": 128,
+            "num_stages": 3,
+            "num_sms": 128,
+            "num_multicast": 2,
+            "multicast_on_a": True,
+            "group_size_m": 16,
+            "group_unroll": 1,
         },
         (4096, 24576, 1536): {
-            "kernel": {"block_n": 128, "num_stages": 4, "group_size_m": 32, "group_unroll": 3},
-            "shared_epilogue": True,
+            "block_m": 128,
+            "block_n": 192,
+            "num_stages": 4,
+            "num_sms": 132,
+            "num_multicast": 1,
+            "multicast_on_a": False,
+            "group_size_m": 32,
+            "group_unroll": 1,
         },
     },
 }
@@ -79,19 +225,14 @@ def _gemm_fp8_1d2d_kernel(
     out_dtype: str,
     *,
     sm_count: int,
+    smem_limit: int,
     shared_epilogue: bool = False,
 ) -> Callable:
-    """Build the persistent 1D2D GEMM; the returned factory takes the tile config.
-
-    The K loop runs in groups of ``scale_a_group`` K-steps, one ``scale_a`` staging
-    each; ``group_unroll`` is how many groups one unrolled iteration covers.
-    """
-    block_m = 128
+    """Build the persistent 1D2D GEMM; the returned factory takes the tile config."""
     half_m = 64
-    block_k = 128
+    block_k = _BLOCK_K
     accum_dtype = "float"
     scale_k = (k + block_k - 1) // block_k
-    scale_a_group = next(g for g in _SCALE_A_GROUPS if scale_k % g == 0)
 
     @tilelang.jit(
         out_idx=[-1],
@@ -105,67 +246,132 @@ def _gemm_fp8_1d2d_kernel(
         ],
     )
     def kernel_func(
+        block_m: int = 128,
         block_n: int = 128,
         num_stages: int = 3,
+        num_sms: int = sm_count,
+        num_multicast: int = 1,
+        multicast_on_a: bool = False,
         group_size_m: int = 16,
         group_unroll: int = 1,
     ) -> Callable:
-        # Each value divides 128, so a tile reads one B-scale block, and is a multiple
-        # of the 16-column STSM atom; any other leaves epilogue columns unwritten.
-        if block_n not in (16, 32, 64, 128):
-            raise ValueError(f"block_n must be one of 16/32/64/128, got {block_n}")
-        if group_size_m < 1:
-            raise ValueError(f"group_size_m must be positive, got {group_size_m}")
-        if num_stages < 1:
-            raise ValueError(f"num_stages must be positive, got {num_stages}")
-        wgmma_helper = f"tl::fp8_gemm_wgmma_64x128_by_128x{block_n}"
-        promotion_helper = f"tl::fp8_gemm_1d2d_promote_64x{block_n}"
-        global_store_helper = f"tl::fp8_gemm_raw_acc_store_global_64x{block_n}_v2"
-        smem_store_helper = f"tl::fp8_gemm_raw_acc_stsm_bf16_64x{block_n}"
+        _validate_schedule(
+            m,
+            n,
+            k,
+            block_m=block_m,
+            block_n=block_n,
+            num_stages=num_stages,
+            num_sms=num_sms,
+            num_multicast=num_multicast,
+            multicast_on_a=multicast_on_a,
+            group_size_m=group_size_m,
+            group_unroll=group_unroll,
+            sm_count=sm_count,
+            smem_limit=smem_limit,
+            shared_epilogue=shared_epilogue,
+        )
+        scale_b_count = 1 if _BLOCK_K % block_n == 0 else 2
+        wgmma_helper = f"tl::fp8_gemm_wgmma_64x128_by_128x{block_n}_lo"
+        promote_helper = (
+            f"tl::fp8_gemm_1d2d_promote_64x{block_n}"
+            if scale_b_count == 1
+            else f"tl::fp8_gemm_1d2d_promote_two_b_scales_64x{block_n}"
+        )
+        store_helper = (
+            f"tl::fp8_gemm_raw_acc_stsm_bf16_swizzled_bm{block_m}_64x{block_n}"
+            if shared_epilogue
+            else f"tl::fp8_gemm_raw_acc_store_global_64x{block_n}_v2"
+        )
+        epilogue_swizzle_bytes = next(w for w in (128, 64, 32) if (block_n * 2) % w == 0)
+        epilogue_block_n = epilogue_swizzle_bytes // 2
+        epilogue_store_count = block_n // epilogue_block_n
+        epilogue_swizzle = {
+            32: _TMA_SWIZZLE_32B,
+            64: _TMA_SWIZZLE_64B,
+            128: _TMA_SWIZZLE_128B,
+        }[epilogue_swizzle_bytes]
         fragment_regs = (half_m * block_n) // 128
+        wave_block_m = 64 if block_m == 64 else 128
+        m_waves = block_m // wave_block_m
+        math_threads = 128 if block_m == 64 else 256
+        total_threads = math_threads + 128
+        math_warps = math_threads // 32
         num_pid_m = -(-m // block_m)
         num_pid_n = -(-n // block_n)
         total_tiles = num_pid_m * num_pid_n
-        max_waves = -(-total_tiles // sm_count)
-        # One wave stages its tile's whole B-scale row before the mainloop; several
-        # waves stage it per K-step in the ring, since the tile changes per wave.
-        stage_1d2d_b_per_k = max_waves > 1
-        producer_threads = 32 if max_waves == 1 else 128
-        num_groups = scale_k // scale_a_group
+        worker_count = num_sms // num_multicast
+        total_tasks = total_tiles // num_multicast
+        max_waves = -(-total_tasks // worker_count)
+        k_unroll_group = next(g for g in (8, 4, 1) if scale_k % g == 0)
+        stage_1d2d_b_per_k = max_waves > 1 and scale_k < 16
+        static_ring = scale_k % num_stages == 0 or (max_waves == 1 and num_multicast == 1)
+        rings_per_task = scale_k // num_stages
+        if static_ring and scale_k % num_stages == 0 and k_unroll_group < num_stages <= 16:
+            k_unroll_group = num_stages
+        k_unroll_factor = k_unroll_group * group_unroll
+        a_tma_annotations = {"cluster_mask": 3} if num_multicast == 2 and multicast_on_a else None
+        b_tma_annotations = (
+            {"cluster_mask": 3} if num_multicast == 2 and not multicast_on_a else None
+        )
+        # TileLang cannot bound the shuffled guard, so the election scope is named here.
+        tma_plain_ann = {"leader_scope_threads": 32}
+        tma_a_ann = {**(a_tma_annotations or {}), **tma_plain_ann}
+        tma_b_ann = {**(b_tma_annotations or {}), **tma_plain_ann}
 
         @T.macro
-        def decode(flat_id, mt, nt):
-            tiles_per_group = T.int32(group_size_m * num_pid_n)
-            group_id = flat_id // tiles_per_group
-            first_m = group_id * T.int32(group_size_m)
-            group_m = T.min(T.int32(group_size_m), T.int32(num_pid_m) - first_m)
-            mt[0] = first_m + (flat_id % tiles_per_group) % group_m
-            nt[0] = (flat_id % tiles_per_group) // group_m
+        def decode(task_id, cluster_rank, mt, nt):
+            if num_multicast == 2:
+                primary = num_pid_n if multicast_on_a else num_pid_m
+                secondary = num_pid_m if multicast_on_a else num_pid_n
+                block_id = task_id * 2 + cluster_rank
+                tiles_per_group = T.int32(group_size_m * secondary)
+                first = (block_id // tiles_per_group) * T.int32(group_size_m)
+                in_group = block_id % tiles_per_group
+                group_len = T.min(T.int32(group_size_m), T.int32(primary) - first)
+                if multicast_on_a:
+                    mt[0] = in_group // group_len
+                    nt[0] = first + in_group % group_len
+                else:
+                    mt[0] = first + in_group % group_len
+                    nt[0] = in_group // group_len
+            else:
+                tiles_per_group = T.int32(group_size_m * num_pid_n)
+                group_id = task_id // tiles_per_group
+                first_m = group_id * T.int32(group_size_m)
+                group_m = T.min(T.int32(group_size_m), T.int32(num_pid_m) - first_m)
+                mt[0] = first_m + (task_id % tiles_per_group) % group_m
+                nt[0] = (task_id % tiles_per_group) // group_m
+
+        def launch():
+            if num_multicast == 2:
+                return T.ClusterKernel(num_sms, cluster_dims=2, threads=total_threads)
+            return T.Kernel(num_sms, threads=total_threads)
 
         @T.prim_func
         def main(
             a: T.Tensor((m, k), dtype),
             b: T.Tensor((n, k), dtype),
-            scale_a: T.Tensor((m, scale_k), "float32"),
+            scale_a: T.Tensor((scale_k, m), "float32"),
             scale_b: T.Tensor(((n + 127) // 128, scale_k), "float32"),
             c: T.Tensor((m, n), out_dtype),
         ) -> None:
-            with T.Kernel(sm_count, threads=384) as (pid,):
+            with launch() as (pid,):
                 a_shared = T.alloc_shared((num_stages, block_m, block_k), dtype)
                 b_shared = T.alloc_shared((num_stages, block_n, block_k), dtype)
-                partial_0 = T.alloc_local((fragment_regs,), accum_dtype)
-                partial_1 = T.alloc_local((fragment_regs,), accum_dtype)
-                final_0 = T.alloc_local((fragment_regs,), accum_dtype)
-                final_1 = T.alloc_local((fragment_regs,), accum_dtype)
+                partial = T.alloc_local((fragment_regs,), accum_dtype)
+                final = T.alloc_local((m_waves, fragment_regs), accum_dtype)
                 if shared_epilogue:
-                    shared_c = T.alloc_shared((block_m, block_n), out_dtype)
-                scale_a_ring = T.alloc_shared(
-                    (_SCALE_A_BUFFERS, block_m, scale_a_group), accum_dtype
-                )
+                    shared_c = T.alloc_shared((block_m * block_n,), out_dtype)
+                scale_a_shared = T.alloc_shared((num_stages, 1, block_m), accum_dtype)
                 if stage_1d2d_b_per_k:
-                    one_scale_b = T.alloc_shared((num_stages, 1), accum_dtype)
+                    # scope="shared": a shared.dyn store here makes TileLang fence it against the
+                    # TMA writes with a barrier one warp cannot complete.
+                    one_scale_b = T.alloc_shared(
+                        (num_stages, scale_b_count), accum_dtype, scope="shared"
+                    )
                 else:
-                    one_scale_b = T.alloc_shared((1, scale_k), accum_dtype)
+                    one_scale_b = T.alloc_shared((scale_b_count, scale_k), accum_dtype)
                 T.annotate_layout(
                     {
                         a_shared: tilelang.layout.make_swizzled_layout(a_shared),
@@ -174,293 +380,292 @@ def _gemm_fp8_1d2d_kernel(
                 )
 
                 full = T.alloc_barrier([1] * num_stages)
-                scale_a_full = T.alloc_barrier([1] * _SCALE_A_BUFFERS)
-                scale_a_empty = T.alloc_barrier([8] * _SCALE_A_BUFFERS)
-                # One arrival per consumer warp: ``wait_wgmma`` is warp-convergent, so
-                # lane 0 speaks for its warp.
-                empty = T.alloc_barrier([8] * num_stages)
+                if num_multicast == 2:
+                    empty = T.alloc_cluster_barrier([num_multicast * math_warps] * num_stages)
+                else:
+                    empty = T.alloc_barrier([math_warps] * num_stages)
                 producer_index = T.alloc_var("int32", init=0)
-                consumer_index_0 = T.alloc_var("int32", init=0)
-                consumer_index_1 = T.alloc_var("int32", init=0)
-                scale_a_producer = T.alloc_var("int32", init=0)
-                scale_a_consumer_0 = T.alloc_var("int32", init=0)
-                scale_a_consumer_1 = T.alloc_var("int32", init=0)
+                consumer_index = T.alloc_var("int32", init=0)
                 mt = T.alloc_local((1,), "int32")
                 nt = T.alloc_local((1,), "int32")
-                # A consumer thread's three scales for one K-step, read before the WGMMA
-                # so the stage is released before the promotion.
-                scales = T.alloc_local((3,), accum_dtype)
+                scales = T.alloc_local((4,), accum_dtype)
                 tx = T.get_thread_binding()
-                # Rows of this thread's WGMMA accumulator within its 64-row half:
-                # lanes 4i..4i+3 of warp w hold rows w*16 + i and w*16 + i + 8.
+                cluster_rank = T.block_rank_in_cluster() if num_multicast == 2 else T.int32(0)
+                if shared_epilogue:
+                    output_desc = T.create_tma_descriptor(
+                        _TMA_BFLOAT16,
+                        2,
+                        c.data,
+                        n,
+                        m,
+                        1,
+                        n * 2,
+                        epilogue_block_n,
+                        block_m,
+                        1,
+                        1,
+                        _TMA_INTERLEAVE_NONE,
+                        epilogue_swizzle,
+                        _TMA_L2_128B,
+                        _TMA_OOB_NONE,
+                    )
+                # Lanes 4i..4i+3 of warp w hold accumulator rows w*16 + i and w*16 + i + 8.
                 acc_row0 = ((tx // 32) % 4) * 16 + (tx % 32) // 4
-                acc_row1 = acc_row0 + 8
 
-                if tx < 128:
-                    T.dec_max_nreg(24)
+                if tx >= math_threads:
+                    T.dec_max_nreg(40)
+                    producer_tx = tx - math_threads
+                    # Shuffled so the value stays warp-uniform for NVCC's uniform datapath.
+                    producer_warp = T.tvm_warp_shuffle(
+                        T.uint32(0xFFFFFFFF), producer_tx // 32, 0, 32, 32
+                    )
                     for wave in T.serial(max_waves):
-                        flat_id = T.int32(sm_count) * wave + pid
-                        if flat_id < total_tiles:
-                            decode(flat_id, mt, nt)
+                        task_id = T.int32(worker_count) * wave + pid // num_multicast
+                        if task_id < total_tasks:
+                            decode(task_id, cluster_rank, mt, nt)
                             m_start = mt[0] * block_m
                             n_start = nt[0] * block_n
-                            if not stage_1d2d_b_per_k and scale_k < 16:
-                                for i in T.Parallel(scale_k):
-                                    scale_row = T.min(n_start // 128, (n + 127) // 128 - 1)
-                                    one_scale_b[0, i] = scale_b[scale_row, i]
-                                T.sync_threads(barrier_id=10, arrive_count=384)
-                            # One lane issues each TMA; on a single wave the other
-                            # producer threads only poll ``empty`` and take issue slots
-                            # from the consumers, so one warp (the election is a warp
-                            # collective) drives the pipeline there.
-                            if tx < producer_threads:
-                                for group in T.unroll(num_groups, unroll_factor=group_unroll):
-                                    for col in T.unroll(scale_a_group):
-                                        kk = group * scale_a_group + col
+                            if producer_warp == 0:
+                                for kk in T.unroll(
+                                    scale_k, unroll_factor=k_unroll_group if static_ring else 1
+                                ):
+                                    if static_ring:
+                                        slot = kk % num_stages
+                                        phase = (wave * rings_per_task + kk // num_stages) & 1
+                                    else:
                                         slot = producer_index % num_stages
-                                        T.barrier_wait(
-                                            empty[slot], ((producer_index // num_stages) & 1) ^ 1
-                                        )
-                                        if stage_1d2d_b_per_k and tx == 0:
-                                            scale_row = T.min(n_start // 128, (n + 127) // 128 - 1)
-                                            one_scale_b[slot, 0] = scale_b[scale_row, kk]
-                                        T.tma_copy(
-                                            a[
-                                                m_start : m_start + block_m,
-                                                kk * block_k : (kk + 1) * block_k,
-                                            ],
-                                            a_shared[slot, :, :],
-                                            barrier=full[slot],
-                                        )
-                                        if col == 0:
-                                            # The next group's scale_a columns in one TMA box; rows
-                                            # past m and columns past scale_k are zero-filled.
-                                            buf = scale_a_producer % _SCALE_A_BUFFERS
-                                            T.barrier_wait(
-                                                scale_a_empty[buf],
-                                                ((scale_a_producer // _SCALE_A_BUFFERS) & 1) ^ 1,
-                                            )
-                                            T.tma_copy(
-                                                scale_a[
-                                                    m_start : m_start + block_m,
-                                                    kk : kk + scale_a_group,
-                                                ],
-                                                scale_a_ring[buf, :, :],
-                                                barrier=scale_a_full[buf],
-                                            )
-                                            if tx == 0:
-                                                T.barrier_arrive(scale_a_full[buf])
-                                            scale_a_producer = scale_a_producer + 1
-                                        if scale_k >= 16 and max_waves == 1 and kk == 0:
+                                        phase = (producer_index // num_stages) & 1
+                                    T.barrier_wait(empty[slot], phase ^ 1)
+                                    T.tma_copy(
+                                        a[
+                                            m_start : m_start + block_m,
+                                            kk * block_k : (kk + 1) * block_k,
+                                        ],
+                                        a_shared[slot, :, :],
+                                        barrier=full[slot],
+                                        annotations=tma_a_ann,
+                                    )
+                                    T.tma_copy(
+                                        scale_a[
+                                            kk : kk + 1,
+                                            m_start : m_start + block_m,
+                                        ],
+                                        scale_a_shared[slot, :, :],
+                                        barrier=full[slot],
+                                        annotations=tma_a_ann,
+                                    )
+                                    T.tma_copy(
+                                        b[
+                                            n_start : n_start + block_n,
+                                            kk * block_k : (kk + 1) * block_k,
+                                        ],
+                                        b_shared[slot, :, :],
+                                        barrier=full[slot],
+                                        annotations=tma_b_ann,
+                                    )
+                                    if stage_1d2d_b_per_k and producer_tx == 0:
+                                        for scale_b_row in T.unroll(scale_b_count):
                                             scale_row = T.min(
-                                                n_start // 128,
+                                                n_start // 128 + scale_b_row,
                                                 (n + 127) // 128 - 1,
                                             )
-                                            T.tma_copy(
-                                                scale_b[scale_row : scale_row + 1, 0:scale_k],
-                                                one_scale_b[:, :],
-                                                barrier=full[slot],
-                                            )
-                                        T.tma_copy(
-                                            b[
-                                                n_start : n_start + block_n,
-                                                kk * block_k : (kk + 1) * block_k,
-                                            ],
-                                            b_shared[slot, :, :],
-                                            barrier=full[slot],
-                                        )
-                                        if tx == 0:
-                                            T.barrier_arrive(full[slot])
+                                            one_scale_b[slot, scale_b_row] = scale_b[scale_row, kk]
+                                    if producer_tx == 0:
+                                        T.barrier_arrive(full[slot])
+                                    if not static_ring:
                                         producer_index = producer_index + 1
+                    if num_multicast == 2 and producer_warp == 0:
+                        tasks_done = T.max(
+                            T.int32(0),
+                            (T.int32(total_tasks) - pid // num_multicast + worker_count - 1)
+                            // worker_count,
+                        )
+                        for drain_slot in T.unroll(num_stages):
+                            if static_ring:
+                                slot = drain_slot
+                                phase = (tasks_done * rings_per_task) & 1
+                            else:
+                                slot = producer_index % num_stages
+                                phase = (producer_index // num_stages) & 1
+                            T.barrier_wait(empty[slot], phase ^ 1)
+                            if not static_ring:
+                                producer_index = producer_index + 1
 
-                elif tx < 256:
-                    T.inc_max_nreg(240)
+                else:
+                    T.inc_max_nreg(232)
+                    math_wg_idx = T.tvm_warp_shuffle(T.uint32(0xFFFFFFFF), tx // 128, 0, 32, 32)
+                    math_wg_offset = math_wg_idx * half_m
+                    a_desc_lo = T.call_extern(
+                        "uint32",
+                        "tl::fp8_gemm_wgmma_desc_lo",
+                        T.address_of(a_shared[0, math_wg_offset, 0]),
+                    )
+                    b_desc_lo = T.call_extern(
+                        "uint32",
+                        "tl::fp8_gemm_wgmma_desc_lo",
+                        T.address_of(b_shared[0, 0, 0]),
+                    )
+                    if num_multicast == 2:
+                        empty_remote = T.call_extern(
+                            "uint32",
+                            "tl::fp8_smem_mapa",
+                            T.call_extern("uint32", "tl::fp8_smem_u32", T.address_of(empty[0])),
+                            T.uint32(tx % 2),
+                        )
+                    scale_a_word = T.call_extern(
+                        "uint32",
+                        "tl::fp8_smem_u32",
+                        T.address_of(scale_a_shared[0, 0, math_wg_offset + acc_row0]),
+                    )
                     for wave in T.serial(max_waves):
-                        flat_id = T.int32(sm_count) * wave + pid
-                        if flat_id < total_tiles:
-                            decode(flat_id, mt, nt)
+                        task_id = T.int32(worker_count) * wave + pid // num_multicast
+                        if task_id < total_tasks:
+                            decode(task_id, cluster_rank, mt, nt)
                             m_start = mt[0] * block_m
                             n_start = nt[0] * block_n
-                            if not stage_1d2d_b_per_k and scale_k < 16:
-                                T.sync_threads(barrier_id=10, arrive_count=384)
-                            T.clear(final_0)
-                            for group in T.unroll(num_groups, unroll_factor=group_unroll):
-                                for col in T.unroll(scale_a_group):
-                                    kk = group * scale_a_group + col
-                                    slot = consumer_index_0 % num_stages
-                                    T.barrier_wait(full[slot], (consumer_index_0 // num_stages) & 1)
-                                    buf = scale_a_consumer_0 % _SCALE_A_BUFFERS
-                                    if col == 0:
-                                        T.barrier_wait(
-                                            scale_a_full[buf],
-                                            (scale_a_consumer_0 // _SCALE_A_BUFFERS) & 1,
+                            if not stage_1d2d_b_per_k:
+                                T.sync_threads(barrier_id=10, arrive_count=math_threads)
+                                for scale_iter in T.serial(
+                                    -(-(scale_b_count * scale_k) // math_threads)
+                                ):
+                                    scale_linear = tx + scale_iter * math_threads
+                                    if scale_linear < scale_b_count * scale_k:
+                                        scale_b_row = scale_linear // scale_k
+                                        scale_col = scale_linear % scale_k
+                                        scale_row = T.min(
+                                            n_start // 128 + scale_b_row,
+                                            (n + 127) // 128 - 1,
                                         )
-                                    scales[0] = scale_a_ring[buf, acc_row0, col]
-                                    scales[1] = scale_a_ring[buf, acc_row1, col]
-                                    if col == scale_a_group - 1:
-                                        if tx % 32 == 0:
-                                            T.barrier_arrive(scale_a_empty[buf])
-                                        scale_a_consumer_0 = scale_a_consumer_0 + 1
-                                    if stage_1d2d_b_per_k:
-                                        scales[2] = one_scale_b[slot, 0]
-                                    else:
-                                        scales[2] = one_scale_b[0, kk]
+                                        one_scale_b[scale_b_row, scale_col] = scale_b[
+                                            scale_row, scale_col
+                                        ]
+                                T.sync_threads(barrier_id=10, arrive_count=math_threads)
+                            T.clear(final)
+                            if scale_b_count == 2:
+                                first_scale_iters = T.min(block_n, 128 - n_start % 128) // 8
+                            for kk in T.unroll(scale_k, unroll_factor=k_unroll_factor):
+                                if static_ring:
+                                    slot = kk % num_stages
+                                    phase = (wave * rings_per_task + kk // num_stages) & 1
+                                else:
+                                    slot = consumer_index % num_stages
+                                    phase = (consumer_index // num_stages) & 1
+                                T.barrier_wait(full[slot], phase)
+                                if stage_1d2d_b_per_k:
+                                    scales[2] = one_scale_b[slot, 0]
+                                    if scale_b_count == 2:
+                                        scales[3] = one_scale_b[slot, 1]
+                                else:
+                                    scales[2] = one_scale_b[0, kk]
+                                    if scale_b_count == 2:
+                                        scales[3] = one_scale_b[1, kk]
+                                for m_wave in T.unroll(m_waves):
+                                    scale_a_offset = (slot * block_m + m_wave * wave_block_m) * 4
+                                    scales[0] = T.call_extern(
+                                        "float32",
+                                        "tl::fp8_lds_f32",
+                                        scale_a_word + T.uint32(scale_a_offset),
+                                    )
+                                    scales[1] = T.call_extern(
+                                        "float32",
+                                        "tl::fp8_lds_f32",
+                                        scale_a_word + T.uint32(scale_a_offset + 8 * 4),
+                                    )
                                     T.call_extern(
                                         "handle",
                                         wgmma_helper,
-                                        partial_0.data,
-                                        T.address_of(a_shared[slot, 0, 0]),
-                                        T.address_of(b_shared[slot, 0, 0]),
+                                        partial.data,
+                                        a_desc_lo
+                                        + T.uint32(
+                                            (slot * block_m + m_wave * wave_block_m)
+                                            * (block_k // 16)
+                                        ),
+                                        b_desc_lo + T.uint32(slot * block_n * (block_k // 16)),
                                     )
                                     T.wait_wgmma(0)
-                                    # Nothing reads the stage past here; releasing it before
-                                    # the promotion overlaps the next TMA with it.
-                                    if tx % 32 == 0:
-                                        T.barrier_arrive(empty[slot])
-                                    T.call_extern(
-                                        "handle",
-                                        promotion_helper,
-                                        partial_0.data,
-                                        final_0.data,
+                                    if m_wave == m_waves - 1:
+                                        if num_multicast == 2:
+                                            if tx % 32 < num_multicast:
+                                                T.call_extern(
+                                                    "handle",
+                                                    "tl::fp8_mbar_arrive_cluster",
+                                                    empty_remote + T.uint32(slot * 8),
+                                                )
+                                        elif tx % 32 == 0:
+                                            T.barrier_arrive(empty[slot])
+                                    promote_args = (
+                                        partial.data,
+                                        T.address_of(final[m_wave, 0]),
                                         scales[0],
                                         scales[1],
                                         scales[2],
                                     )
-                                    consumer_index_0 = consumer_index_0 + 1
+                                    if scale_b_count == 1:
+                                        T.call_extern("handle", promote_helper, *promote_args)
+                                    elif block_n == 192:
+                                        if first_scale_iters == 8:
+                                            T.call_extern(
+                                                "handle",
+                                                f"{promote_helper}_split8",
+                                                *promote_args,
+                                                scales[3],
+                                            )
+                                        else:
+                                            T.call_extern(
+                                                "handle",
+                                                f"{promote_helper}_split16",
+                                                *promote_args,
+                                                scales[3],
+                                            )
+                                    else:
+                                        T.call_extern(
+                                            "handle",
+                                            promote_helper,
+                                            *promote_args,
+                                            scales[3],
+                                            first_scale_iters,
+                                        )
+                                if not static_ring:
+                                    consumer_index = consumer_index + 1
                             if shared_epilogue:
-                                # The previous tile's TMA store may still read shared_c;
-                                # waiting here rather than after issuing it lets the
-                                # store overlap this tile's mainloop.
-                                if tx == 128:
-                                    T.tma_store_wait(0)
-                                T.sync_threads(barrier_id=13, arrive_count=256)
-                                T.call_extern(
-                                    "handle",
-                                    smem_store_helper,
-                                    final_0.data,
-                                    T.address_of(shared_c[0, 0]),
-                                )
-                                T.fence_proxy_async()
-                                T.sync_threads(barrier_id=14, arrive_count=256)
-                                if tx == 128:
-                                    output_desc = T.create_tma_descriptor(
-                                        _TMA_BFLOAT16,
-                                        2,
-                                        c.data,
-                                        n,
-                                        m,
-                                        1,
-                                        n * 2,
-                                        block_n,
-                                        block_m,
-                                        1,
-                                        1,
-                                        _TMA_INTERLEAVE_NONE,
-                                        _TMA_SWIZZLE_NONE,
-                                        _TMA_L2_128B,
-                                        _TMA_OOB_NONE,
+                                if max_waves > 1:
+                                    if tx < epilogue_store_count:
+                                        T.tma_store_wait(0)
+                                    T.sync_threads(barrier_id=13, arrive_count=math_threads)
+                                for m_wave in T.unroll(m_waves):
+                                    T.call_extern(
+                                        "handle",
+                                        store_helper,
+                                        T.address_of(final[m_wave, 0]),
+                                        T.address_of(shared_c[0]),
+                                        m_wave * wave_block_m + math_wg_offset,
                                     )
+                                T.fence_proxy_async()
+                                T.sync_threads(barrier_id=14, arrive_count=math_threads)
+                                if tx < epilogue_store_count:
                                     T.call_extern(
                                         "handle",
                                         "tl::fp8_tma_store_2d_issue",
                                         output_desc,
-                                        T.address_of(shared_c[0, 0]),
-                                        n_start,
+                                        T.address_of(shared_c[tx * block_m * epilogue_block_n]),
+                                        n_start + tx * epilogue_block_n,
                                         m_start,
                                     )
                                     T.tma_store_arrive()
                             else:
-                                T.call_extern(
-                                    "handle",
-                                    global_store_helper,
-                                    final_0.data,
-                                    c.data,
-                                    n,
-                                    m_start,
-                                    n_start,
-                                    m,
-                                    n,
-                                )
-                    # Drain the last tile's store before the CTA's shared memory goes.
-                    if shared_epilogue and tx == 128:
+                                for m_wave in T.unroll(m_waves):
+                                    T.call_extern(
+                                        "handle",
+                                        store_helper,
+                                        T.address_of(final[m_wave, 0]),
+                                        c.data,
+                                        m_start + m_wave * wave_block_m + math_wg_offset,
+                                        n_start,
+                                        m,
+                                        n,
+                                    )
+                    if shared_epilogue and tx < epilogue_store_count:
                         T.tma_store_wait(0)
-
-                else:
-                    T.inc_max_nreg(240)
-                    for wave in T.serial(max_waves):
-                        flat_id = T.int32(sm_count) * wave + pid
-                        if flat_id < total_tiles:
-                            decode(flat_id, mt, nt)
-                            m_start = mt[0] * block_m
-                            n_start = nt[0] * block_n
-                            if not stage_1d2d_b_per_k and scale_k < 16:
-                                T.sync_threads(barrier_id=10, arrive_count=384)
-                            T.clear(final_1)
-                            for group in T.unroll(num_groups, unroll_factor=group_unroll):
-                                for col in T.unroll(scale_a_group):
-                                    kk = group * scale_a_group + col
-                                    slot = consumer_index_1 % num_stages
-                                    T.barrier_wait(full[slot], (consumer_index_1 // num_stages) & 1)
-                                    buf = scale_a_consumer_1 % _SCALE_A_BUFFERS
-                                    if col == 0:
-                                        T.barrier_wait(
-                                            scale_a_full[buf],
-                                            (scale_a_consumer_1 // _SCALE_A_BUFFERS) & 1,
-                                        )
-                                    scales[0] = scale_a_ring[buf, half_m + acc_row0, col]
-                                    scales[1] = scale_a_ring[buf, half_m + acc_row1, col]
-                                    if col == scale_a_group - 1:
-                                        if tx % 32 == 0:
-                                            T.barrier_arrive(scale_a_empty[buf])
-                                        scale_a_consumer_1 = scale_a_consumer_1 + 1
-                                    if stage_1d2d_b_per_k:
-                                        scales[2] = one_scale_b[slot, 0]
-                                    else:
-                                        scales[2] = one_scale_b[0, kk]
-                                    T.call_extern(
-                                        "handle",
-                                        wgmma_helper,
-                                        partial_1.data,
-                                        T.address_of(a_shared[slot, half_m, 0]),
-                                        T.address_of(b_shared[slot, 0, 0]),
-                                    )
-                                    T.wait_wgmma(0)
-                                    # Nothing reads the stage past here; releasing it before
-                                    # the promotion overlaps the next TMA with it.
-                                    if tx % 32 == 0:
-                                        T.barrier_arrive(empty[slot])
-                                    T.call_extern(
-                                        "handle",
-                                        promotion_helper,
-                                        partial_1.data,
-                                        final_1.data,
-                                        scales[0],
-                                        scales[1],
-                                        scales[2],
-                                    )
-                                    consumer_index_1 = consumer_index_1 + 1
-                            if shared_epilogue:
-                                T.sync_threads(barrier_id=13, arrive_count=256)
-                                T.call_extern(
-                                    "handle",
-                                    smem_store_helper,
-                                    final_1.data,
-                                    T.address_of(shared_c[half_m, 0]),
-                                )
-                                T.fence_proxy_async()
-                                T.sync_threads(barrier_id=14, arrive_count=256)
-                            else:
-                                T.call_extern(
-                                    "handle",
-                                    global_store_helper,
-                                    final_1.data,
-                                    c.data,
-                                    n,
-                                    m_start + half_m,
-                                    n_start,
-                                    m,
-                                    n,
-                                )
 
         return main
 
@@ -470,8 +675,8 @@ def _gemm_fp8_1d2d_kernel(
 class GemmFp81D2DFwdKernel(Kernel):
     """FP8 NT GEMM for 1D2D scales, bfloat16 output, no bias.
 
-    ``scale_a`` is ``[M, ceil(K/128)]`` and ``scale_b`` is
-    ``[ceil(N/128), ceil(K/128)]``, both row-major.
+    ``scale_a`` is logically ``[M, ceil(K/128)]`` with stride ``(1, M)``;
+    ``scale_b`` is row-major ``[ceil(N/128), ceil(K/128)]``.
 
     Args:
         m: Rows of ``a``; at least 128.
@@ -480,55 +685,33 @@ class GemmFp81D2DFwdKernel(Kernel):
         dtype: Operand dtype; ``torch.float8_e4m3fn``.
         out_dtype: Output dtype; ``torch.bfloat16``.
         config: Kernel config override; unset keys take their default.
-        tune: Accepted for the common kernel interface; no ``autotune_configs``
-            are declared, so the schedule comes from ``default_config``.
+        tune: Whether to autotune over :attr:`autotune_configs`.
         device_index: The device the kernel is built for.
         shared_epilogue: Whether to stage the tile through shared memory and store
             it with TMA. ``None`` takes the calibrated choice for this shape.
     """
 
     @staticmethod
-    def _calibrated_epilogue(m: int, n: int, k: int, calibration: Optional[str]) -> bool:
-        """Whether the schedule calibrated on *calibration*'s board stores through shared memory.
-
-        False off a calibrated board or shape: the packed global store has the
-        smaller unit, so it addresses every shape the other one does.
-        """
-        tuned = _FP8_1D2D_CONFIGS.get(calibration, {}).get((m, n, k))
-        return bool(tuned["shared_epilogue"]) if tuned is not None else False
+    def _uses_shared_epilogue(n: int) -> bool:
+        """Whether the TMA epilogue can address this ``n``; a narrower one is stored packed."""
+        return n % 8 == 0
 
     @staticmethod
-    def _shape_refusal(m: int, n: int, k: int, *, shared_epilogue: bool) -> Optional[str]:
-        """Why this schedule cannot address these shapes, or ``None`` when it can.
+    def _shape_refusal(m: int, n: int, k: int) -> Optional[str]:
+        """Why this kernel cannot address these shapes, or ``None`` when it can.
 
-        ``a``, ``b`` and ``scale_a`` arrive through TMA, whose descriptors address the
-        innermost (contiguous) dimension in 16-byte units: ``k`` for the fp8 operands,
-        ``ceil(k / 128)`` for the fp32 ``scale_a``. The epilogue adds its own
-        unit: two BF16 columns per packed global store, or a descriptor row stride of
-        16 bytes for the shared-memory path. Below one 128-row tile the tile is
-        mostly padding.
+        TMA addresses the contiguous dimension in 16-byte units -- ``k`` for the fp8
+        operands, ``m`` for ``scale_a.T`` -- and the packed global store writes ``c``
+        two BF16 columns at a time.
         """
         if m < 128:
             return f"m={m} is below one 128-row tile"
-        store_unit = 8 if shared_epilogue else 2
         offenders = [
             f"{name}={value} is not a multiple of {unit} ({what})"
             for name, value, unit, what in (
                 ("k", k, 16, "a and b are read K-major through TMA, 16 fp8 per 16 bytes"),
-                (
-                    "ceil(k / 128)",
-                    -(-k // 128),
-                    4,
-                    "scale_a is read row-major through TMA, 4 fp32 per 16 bytes",
-                ),
-                (
-                    "n",
-                    n,
-                    store_unit,
-                    "the TMA epilogue needs a 16-byte row stride in c"
-                    if shared_epilogue
-                    else "the epilogue writes c two BF16 columns at a time",
-                ),
+                ("m", m, 4, "scale_a.T is read M-major through TMA, 4 fp32 per 16 bytes"),
+                ("n", n, 2, "the epilogue writes c two BF16 columns at a time"),
             )
             if value % unit
         ]
@@ -542,16 +725,11 @@ class GemmFp81D2DFwdKernel(Kernel):
     def applies(cls, call: GemmCall) -> bool:
         return (
             call.block_scale_grid == "1d2d"
+            and call.scale_a_stride == (1, call.m)
             and call.dtype == torch.float8_e4m3fn
             and call.out_dtype == torch.bfloat16
             and not call.has_bias
-            and cls._shape_refusal(
-                call.m,
-                call.n,
-                call.k,
-                shared_epilogue=cls._calibrated_epilogue(call.m, call.n, call.k, call.calibration),
-            )
-            is None
+            and cls._shape_refusal(call.m, call.n, call.k) is None
         )
 
     @classmethod
@@ -594,18 +772,15 @@ class GemmFp81D2DFwdKernel(Kernel):
         self.sm_count = get_sm_count(self.device_index)
         calibration = device_calibration(self.device_index)
         self._calibrated = _FP8_1D2D_CONFIGS.get(calibration, {}).get((m, n, k))
-        if self._calibrated is not None:
-            self.sm_count = int(self._calibrated.get("sm_count", self.sm_count))
         self.shared_epilogue = (
-            self._calibrated_epilogue(m, n, k, calibration)
-            if shared_epilogue is None
-            else bool(shared_epilogue)
+            self._uses_shared_epilogue(n) if shared_epilogue is None else bool(shared_epilogue)
         )
 
-        refusal = self._shape_refusal(m, n, k, shared_epilogue=self.shared_epilogue)
+        refusal = self._shape_refusal(m, n, k)
         if refusal is not None:
             raise ValueError(f"{type(self).__name__} cannot serve m={m} n={n} k={k}: {refusal}")
 
+        self.smem_limit = _dynamic_smem_limit(self.device_index)
         self.kernel = _gemm_fp8_1d2d_kernel(
             m,
             n,
@@ -613,6 +788,7 @@ class GemmFp81D2DFwdKernel(Kernel):
             self.dtype_str,
             self.out_dtype_str,
             sm_count=self.sm_count,
+            smem_limit=self.smem_limit,
             shared_epilogue=self.shared_epilogue,
         )
         self.init_config(config, tune)
@@ -624,7 +800,7 @@ class GemmFp81D2DFwdKernel(Kernel):
     @property
     def default_config(self) -> dict:
         if self._calibrated is not None:
-            return dict(self._calibrated["kernel"])
+            return dict(self._calibrated)
         m_tiles = (self.m + 127) // 128
         target_n = self.n * m_tiles / self.sm_count
         if target_n <= 24:
@@ -636,11 +812,68 @@ class GemmFp81D2DFwdKernel(Kernel):
         else:
             block_n = 128
         return {
+            "block_m": 128,
             "block_n": block_n,
             "num_stages": 3,
+            "num_sms": self.sm_count,
+            "num_multicast": 1,
+            "multicast_on_a": False,
             "group_size_m": 16,
             "group_unroll": 1,
         }
+
+    @property
+    def autotune_configs(self) -> list[dict]:
+        """The legal SM90 1D2D configuration space."""
+        block_m_options = [64, 128] if self.m < 256 else [64, 128, 256]
+        block_n_options = [16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 192]
+        default = self.default_config
+        group_size_m = int(default["group_size_m"])
+        group_unroll = int(default["group_unroll"])
+        scale_k = -(-self.k // _BLOCK_K)
+
+        configs = []
+        for block_m in block_m_options:
+            for block_n in block_n_options:
+                if block_m > 128 and block_n > 128:
+                    continue
+                num_blocks = -(-self.m // block_m) * -(-self.n // block_n)
+                num_waves = -(-num_blocks // self.sm_count)
+                min_sms = -(-num_blocks // num_waves)
+                multicast_options = [(1, False)]
+                if self.m >= 512 and self.sm_count % 2 == 0 and group_size_m % 2 == 0:
+                    if -(-self.m // block_m) % 2 == 0:
+                        multicast_options.append((2, False))
+                    if -(-self.n // block_n) % 2 == 0:
+                        multicast_options.append((2, True))
+                for num_stages in range(1, 13):
+                    smem_bytes = _dynamic_smem_bytes(
+                        block_m=block_m,
+                        block_n=block_n,
+                        num_stages=num_stages,
+                        scale_k=scale_k,
+                        scale_b_count=1 if 128 % block_n == 0 else 2,
+                        shared_epilogue=self.shared_epilogue,
+                        stage_scale_b_per_k=False,
+                    )
+                    if smem_bytes > self.smem_limit:
+                        continue
+                    for num_multicast, multicast_on_a in multicast_options:
+                        aligned_min_sms = -(-min_sms // num_multicast) * num_multicast
+                        for num_sms in sorted({aligned_min_sms, self.sm_count}):
+                            configs.append(
+                                {
+                                    "block_m": block_m,
+                                    "block_n": block_n,
+                                    "num_stages": num_stages,
+                                    "num_sms": num_sms,
+                                    "num_multicast": num_multicast,
+                                    "multicast_on_a": multicast_on_a,
+                                    "group_size_m": group_size_m,
+                                    "group_unroll": group_unroll,
+                                }
+                            )
+        return configs
 
     def forward(
         self,
@@ -652,4 +885,4 @@ class GemmFp81D2DFwdKernel(Kernel):
     ) -> torch.Tensor:
         if bias is not None:
             raise ValueError(f"{type(self).__name__} has no bias epilogue")
-        return self.kernel(**self.config)(a, b, scale_a, scale_b)
+        return self.kernel(**self.config)(a, b, scale_a.T, scale_b)

@@ -37,6 +37,7 @@ class GemmCall(CallSpec):
     trans_b: bool = False
     # FP8 only: the scale grids and the bias separate the kernels, out_dtype builds them.
     scale_a_shape: Optional[tuple] = None
+    scale_a_stride: Optional[tuple] = None
     scale_b_shape: Optional[tuple] = None
     out_dtype: Optional[torch.dtype] = None
     has_bias: bool = False

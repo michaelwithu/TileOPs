@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from tests.test_base import FixtureBase, TestBase, served_in_tree
+from tests.test_base import FixtureBase, TestBase, served_in_tree, standard_tolerance
 from tileops.backend import BUILTIN
 from tileops.kernels.gemm import (
     GemmCpAsyncKernel,
@@ -16,7 +16,11 @@ from tileops.kernels.gemm.dense import (
     _b_eviction,
     _bandwidth_autotune_grid,
 )
-from tileops.kernels.gemm.fp8_1d2d import GemmFp81D2DFwdKernel
+from tileops.kernels.gemm.fp8_1d2d import (
+    _FP8_1D2D_CONFIGS,
+    GemmFp81D2DFwdKernel,
+    _validate_schedule,
+)
 from tileops.kernels.gemm.heuristics import (
     best_config,
     gemv_config,
@@ -25,6 +29,7 @@ from tileops.kernels.gemm.heuristics import (
 )
 from tileops.kernels.gemm.w4a16 import GROUP_SIZE, _select_config, _stage_meta_per_tile
 from tileops.ops import GemmFp8FwdOp, GemmFwdOp, GemmW4A16FwdOp
+from tileops.utils import device_calibration
 from workloads.device import run_device
 from workloads.gemm import (
     GemmFp8Workload,
@@ -675,6 +680,39 @@ def test_gemm_fp8_block128_single_k_block_uses_block_kernel() -> None:
         assert op.kernel.__class__.__name__ == "GemmFp8BlockScaleKernel"
 
 
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+def test_gemm_fp8_refuses_sm89() -> None:
+    """SM89 has FP8 tensor cores but not the TMA and WGMMA the FP8 kernels are built on."""
+    m, n, k = 128, 256, 512
+    for scale_a_shape, scale_b_shape in (((1, 1), (1, 1)), ((m, k // 128), (n, k // 128))):
+        call = GemmCall(
+            arch=89,
+            sm_count=1,
+            m=m,
+            n=n,
+            k=k,
+            dtype=torch.float8_e4m3fn,
+            trans_b=True,
+            scale_a_shape=scale_a_shape,
+            scale_b_shape=scale_b_shape,
+            out_dtype=torch.bfloat16,
+        )
+        with pytest.raises(ValueError, match="no implementation serves this call"):
+            GemmFp8FwdOp().select_kernel(call)
+
+
+@pytest.mark.sm90
+@pytest.mark.cuda_only
+@pytest.mark.smoke
+def test_gemm_fp8_1d2d_requires_m_contiguous_scale_a() -> None:
+    test = GemmFp8Test(128, 256, 512, torch.float8_e4m3fn, "block128x128")
+    a, b, scale_a, scale_b = test.gen_inputs()
+    assert scale_a.shape == (128, 4) and scale_a.stride() == (1, 128)
+    with pytest.raises(ValueError, match="scale_a must be M-contiguous"):
+        GemmFp8FwdOp()(a, b, scale_a.contiguous(), scale_b)
+
+
 @pytest.mark.cuda_only
 @pytest.mark.parametrize(
     ("shape", "expected"),
@@ -717,7 +755,28 @@ def test_gemm_fp8_block128_default_config(
     assert (kernel.config["block_n"], kernel.config["num_stages"]) == expected
 
 
-@pytest.mark.sm90
+# The parameters a 1D2D case does not name. ``num_sms`` is left out so it follows
+# the device the test runs on, not the board the schedules were calibrated for.
+_1D2D_BASE_CONFIG = {
+    "block_m": 128,
+    "block_n": 128,
+    "num_stages": 4,
+    "group_size_m": 16,
+    "group_unroll": 1,
+}
+# ``_validate_schedule`` takes the device limits the builder passes it; a rejection
+# case fixes them so it asserts about its own parameter and nothing else.
+_1D2D_VALIDATION_ARGS = {
+    **_1D2D_BASE_CONFIG,
+    "num_sms": 8,
+    "num_multicast": 1,
+    "multicast_on_a": False,
+    "sm_count": 132,
+    "smem_limit": 231424,
+    "shared_epilogue": True,
+}
+
+
 @pytest.mark.cuda_only
 @pytest.mark.in_tree_kernels
 @pytest.mark.smoke
@@ -743,33 +802,12 @@ def test_gemm_fp8_block_scale_selection(
         dtype=torch.float8_e4m3fn,
         trans_b=True,
         scale_a_shape=(m, k // 128),
+        scale_a_stride=(1, m) if scale_b_rows == 128 else (k // 128, 1),
         scale_b_shape=(-(-n // scale_b_rows), k // 128),
         out_dtype=out_dtype,
         has_bias=bias,
     )
     assert GemmFp8FwdOp(out_dtype=out_dtype).select_kernel(call).__name__ == expected
-
-
-@pytest.mark.in_tree_kernels
-@pytest.mark.smoke
-def test_gemm_fp8_refuses_sm89() -> None:
-    """SM89 has FP8 tensor cores but not the TMA and WGMMA the FP8 kernels are built on."""
-    m, n, k = 128, 256, 512
-    for scale_a_shape, scale_b_shape in (((1, 1), (1, 1)), ((m, k // 128), (n, k // 128))):
-        call = GemmCall(
-            arch=89,
-            sm_count=1,
-            m=m,
-            n=n,
-            k=k,
-            dtype=torch.float8_e4m3fn,
-            trans_b=True,
-            scale_a_shape=scale_a_shape,
-            scale_b_shape=scale_b_shape,
-            out_dtype=torch.bfloat16,
-        )
-        with pytest.raises(ValueError, match="no implementation serves this call"):
-            GemmFp8FwdOp().select_kernel(call)
 
 
 @pytest.mark.sm90
@@ -783,6 +821,230 @@ def test_gemm_fp8_1d2d_shared_epilogue_matches_reference() -> None:
     )
     inputs = test.gen_inputs()
     torch.testing.assert_close(kernel(*inputs), test.ref_program(*inputs), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.sm90
+@pytest.mark.cuda_only
+@pytest.mark.parametrize(
+    ("shape", "config", "shared_epilogue"),
+    [
+        # Shape coverage: the smallest shape both the kernel and the workload
+        # admit -- one M tile, one K block, an N tile eight columns wide.
+        pytest.param(
+            (128, 8, 128), {"block_n": 16}, True, id="smallest-legal", marks=pytest.mark.smoke
+        ),
+        # Feature coverage: the whole tile reaches global memory through shared
+        # memory and one TMA store.
+        pytest.param((128, 256, 512), {}, True, id="shared-epilogue", marks=pytest.mark.smoke),
+        # Shape coverage: K does not fill its last 128-block, so the last B scale
+        # covers a partial block and the operands' K tail is zero-padded.
+        pytest.param((128, 256, 144), {}, True, id="k-tail", marks=pytest.mark.smoke),
+        # Shape coverage: neither M nor N fills its tile, through the packed
+        # global-memory epilogue, which clamps both tails itself.
+        pytest.param(
+            (200, 300, 512),
+            {"block_n": 96},
+            False,
+            id="global-store-tails",
+            marks=pytest.mark.smoke,
+        ),
+        # Shape coverage: BN192 straddles two 128-column B scales, splitting at
+        # 128 columns for an even tile and 64 for an odd one.
+        pytest.param(
+            (128, 384, 512), {"block_n": 192}, True, id="bn192-split", marks=pytest.mark.smoke
+        ),
+        # Feature coverage: a two-CTA cluster multicasts either shared operand.
+        pytest.param(
+            (256, 256, 512),
+            {"num_sms": 4, "num_multicast": 2, "multicast_on_a": False},
+            True,
+            id="multicast-b",
+            marks=pytest.mark.smoke,
+        ),
+        pytest.param(
+            (256, 256, 512),
+            {"num_sms": 4, "num_multicast": 2, "multicast_on_a": True},
+            True,
+            id="multicast-a",
+            marks=pytest.mark.smoke,
+        ),
+        # Feature coverage: block_m=256 names its own STSM helper, and is the tile
+        # three calibrated schedules ship with.
+        pytest.param(
+            (512, 512, 512),
+            {"block_m": 256, "num_stages": 3},
+            True,
+            id="bm256",
+            marks=pytest.mark.smoke,
+        ),
+        # Shape coverage: three K blocks fill one three-stage ring, so every task
+        # starts on slot 0 and the barrier phase follows from the wave.
+        pytest.param(
+            (1024, 512, 384),
+            {"num_stages": 3, "num_sms": 8, "num_multicast": 2, "multicast_on_a": True},
+            True,
+            id="whole-rings-multicast-a",
+            marks=pytest.mark.smoke,
+        ),
+        # Shape coverage: three K blocks leave a four-stage ring part-filled, so
+        # the ring position is carried across tasks.
+        pytest.param(
+            (1024, 512, 384),
+            {"num_stages": 4, "num_sms": 8, "num_multicast": 2, "multicast_on_a": False},
+            True,
+            id="partial-ring-multicast-b",
+            marks=pytest.mark.full,
+        ),
+        # Feature coverage: over several waves the math warp-groups preload the
+        # whole B-scale row instead of staging it per K block.
+        pytest.param(
+            (512, 8576, 2048),
+            {"block_m": 256, "num_stages": 3},
+            False,
+            id="multiwave-whole-row-scale-b",
+            marks=pytest.mark.full,
+        ),
+        # Feature coverage: the parameter values only calibrated schedules carry --
+        # a ring as deep as the K blocks, a multi-group unroll, and a narrow group.
+        pytest.param(
+            (128, 256, 1792),
+            {"block_m": 64, "block_n": 32, "num_stages": 14},
+            True,
+            id="deep-static-ring",
+            marks=pytest.mark.full,
+        ),
+        pytest.param(
+            (512, 512, 512),
+            {"block_m": 256, "num_stages": 3, "group_size_m": 8, "group_unroll": 3},
+            True,
+            id="group-unroll",
+            marks=pytest.mark.full,
+        ),
+        pytest.param(
+            (512, 512, 512),
+            {"num_sms": 4, "num_multicast": 2, "multicast_on_a": False, "group_size_m": 2},
+            True,
+            id="narrow-group",
+            marks=pytest.mark.full,
+        ),
+        # Shape coverage: the remaining legal SM90 tile widths. Each names
+        # a distinct promotion helper, and ``n`` crosses a 128-column B scale so
+        # the two scales a tile sees differ. bn48 carries block_m=64 with it.
+        *[
+            pytest.param(
+                (128, block_n * 3, 512),
+                {"block_m": block_m, "block_n": block_n},
+                True,
+                id=f"bn{block_n}" if block_m == 128 else f"bm{block_m}-bn{block_n}",
+                marks=pytest.mark.full,
+            )
+            for block_m, block_n in (
+                (64, 48),
+                (128, 80),
+                (128, 96),
+                (128, 112),
+                (128, 144),
+                (128, 160),
+            )
+        ],
+    ],
+)
+def test_gemm_fp8_1d2d_schedule_matches_reference(
+    shape: tuple[int, int, int], config: dict, shared_epilogue: bool
+) -> None:
+    """Each distinct 1D2D code path computes the reference result."""
+    m, n, k = shape
+    test = GemmFp8Test(m, n, k, torch.float8_e4m3fn, "block128x128")
+    kernel = GemmFp81D2DFwdKernel(
+        m,
+        n,
+        k,
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        config={**_1D2D_BASE_CONFIG, **config},
+        shared_epilogue=shared_epilogue,
+    )
+    test.check(kernel, *test.gen_inputs(), **standard_tolerance(torch.bfloat16))
+
+
+@pytest.mark.sm90
+@pytest.mark.cuda_only
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+def test_gemm_fp8_1d2d_calibrated_schedules_are_buildable() -> None:
+    """Every schedule this board ships with is one the builder accepts.
+
+    Compile-free. A calibrated entry is a performance choice, so nothing else
+    would catch one that the builder refuses for its own shape.
+    """
+    calibrated = _FP8_1D2D_CONFIGS.get(device_calibration())
+    if not calibrated:
+        pytest.skip("this board carries no calibrated 1D2D schedule")
+    for m, n, k in calibrated:
+        kernel = GemmFp81D2DFwdKernel(m, n, k, torch.float8_e4m3fn, torch.bfloat16)
+        assert kernel.config == kernel.default_config
+        _validate_schedule(
+            m,
+            n,
+            k,
+            **kernel.config,
+            sm_count=kernel.sm_count,
+            smem_limit=kernel.smem_limit,
+            shared_epilogue=kernel.shared_epilogue,
+        )
+
+
+@pytest.mark.sm90
+@pytest.mark.cuda_only
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("config", "message"),
+    [
+        pytest.param({"block_m": 100}, "block_m must be one of", id="block-m-illegal"),
+        pytest.param({"block_n": 56}, "block_n must be one of", id="block-n-splits-scale-block"),
+        pytest.param(
+            {"block_m": 256, "block_n": 144}, "block_m=256 requires", id="bm256-wide-tile"
+        ),
+        pytest.param({"group_size_m": 0}, "group_size_m must be positive", id="group-size-zero"),
+        pytest.param({"group_unroll": 0}, "group_unroll must be positive", id="group-unroll-zero"),
+        pytest.param({"num_stages": 0}, "num_stages must be positive", id="stages-zero"),
+        pytest.param({"num_sms": 0}, "num_sms must be in", id="sms-zero"),
+        pytest.param({"num_multicast": 3}, "num_multicast must be 1 or 2", id="multicast-three"),
+        pytest.param(
+            {"multicast_on_a": True},
+            "multicast_on_a requires",
+            id="multicast-axis-without-cluster",
+        ),
+        pytest.param(
+            {"num_sms": 6, "num_multicast": 2, "group_size_m": 15},
+            "must be even",
+            id="odd-group-with-cluster",
+        ),
+        pytest.param(
+            {"num_sms": 7, "num_multicast": 2}, "must be divisible by", id="odd-sms-with-cluster"
+        ),
+        pytest.param({"num_stages": 64}, "bytes of shared memory", id="stages-over-shared-memory"),
+    ],
+)
+def test_gemm_fp8_1d2d_rejects_an_illegal_schedule(config: dict, message: str) -> None:
+    """The builder names the parameter it refuses, before anything is compiled."""
+    with pytest.raises(ValueError, match=message):
+        _validate_schedule(256, 256, 512, **{**_1D2D_VALIDATION_ARGS, **config})
+
+
+@pytest.mark.sm90
+@pytest.mark.cuda_only
+@pytest.mark.smoke
+def test_gemm_fp8_1d2d_rejects_an_odd_multicast_tile_count() -> None:
+    """A cluster pairs neighbouring tiles, so its axis cannot hold an odd count."""
+    config = {
+        **_1D2D_VALIDATION_ARGS,
+        "block_n": 64,
+        "num_multicast": 2,
+        "multicast_on_a": True,
+    }
+    with pytest.raises(ValueError, match="multicast on N requires an even tile count"):
+        _validate_schedule(512, 2112, 7168, **config)
 
 
 @pytest.mark.sm90
@@ -801,6 +1063,34 @@ def test_gemm_fp8_1d2d_refuses_a_block_n_that_splits_a_scale_block() -> None:
     inputs = GemmFp8Test(128, 256, 512, torch.float8_e4m3fn, "block128x128").gen_inputs()
     with pytest.raises(ValueError, match="block_n must be one of"):
         kernel(*inputs)
+
+
+@pytest.mark.sm90
+@pytest.mark.cuda_only
+@pytest.mark.in_tree_kernels
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("m", "n", "k"),
+    [
+        pytest.param(128, 2112, 7168, id="single-wave"),
+        pytest.param(4096, 4096, 7168, id="many-waves"),
+        pytest.param(3000, 1696, 4096, id="off-table"),
+    ],
+)
+def test_gemm_fp8_1d2d_search_space_is_buildable(m: int, n: int, k: int) -> None:
+    """Every schedule the kernel offers a search is one the builder accepts.
+
+    Compile-free: the builder answers a configuration before compiling it, so the
+    whole space can be checked without building any of it.
+    """
+    kernel = GemmFp81D2DFwdKernel(m, n, k, torch.float8_e4m3fn, torch.bfloat16)
+    limits = {
+        "sm_count": kernel.sm_count,
+        "smem_limit": kernel.smem_limit,
+        "shared_epilogue": kernel.shared_epilogue,
+    }
+    for config in [kernel.default_config, *kernel.autotune_configs]:
+        _validate_schedule(m, n, k, **config, **limits)
 
 
 @GemvBoundaryFixture
@@ -822,7 +1112,6 @@ def test_gemv_boundary_rhs_col(n: int, k: int, dtype: torch.dtype, tune: bool) -
     test.check(op, *test.gen_inputs(), **tolerances)
 
 
-@pytest.mark.sm90
 @pytest.mark.cuda_only
 @pytest.mark.smoke
 def test_lhs_rows_band_dispatch() -> None:
@@ -834,6 +1123,11 @@ def test_lhs_rows_band_dispatch() -> None:
     enough for the operand-swapped grid. Selection only — no kernel is built, so this
     stays smoke-fast.
     """
+    from tileops.utils import get_sm_version
+
+    if get_sm_version() not in (GemvKernel.supported_archs or []):
+        pytest.skip("the bandwidth-bound band is SM90-only")
+
     nt = GemmFwdOp(trans_a=False, trans_b=True)
     fp = torch.float16
     two_rows = nt._call_spec(2, 2112, 7168, fp)
@@ -848,7 +1142,6 @@ def test_lhs_rows_band_dispatch() -> None:
     assert nn.select_kernel(nn._call_spec(2, 2112, 7168, fp)) is GemmTmaKernel
 
 
-@pytest.mark.sm90
 @pytest.mark.cuda_only
 @pytest.mark.smoke
 def test_gemv_bands_build_their_own_body_and_config() -> None:
@@ -858,7 +1151,10 @@ def test_gemv_bands_build_their_own_body_and_config() -> None:
     this asserts: how many rows the body contracts, which config rule picks its
     parameters, and that two bands never share a cache entry.
     """
-    from tileops.utils import get_sm_count
+    from tileops.utils import get_sm_count, get_sm_version
+
+    if get_sm_version() not in (GemvKernel.supported_archs or []):
+        pytest.skip("the bandwidth-bound band is SM90-only")
 
     fp = torch.float16
     nt = GemmFwdOp(trans_a=False, trans_b=True)
@@ -888,7 +1184,6 @@ def test_gemv_bands_build_their_own_body_and_config() -> None:
         GemvKernel("m2", 2, 2112, 7168, fp)
 
 
-@pytest.mark.sm90
 @pytest.mark.cuda_only
 @pytest.mark.smoke
 def test_explicit_structure_config_is_taken_verbatim() -> None:
@@ -899,6 +1194,11 @@ def test_explicit_structure_config_is_taken_verbatim() -> None:
     values — asking for ``coop2s`` on a shape the selector serves with ``coop2``
     yielded ``coop2`` at ``coop2s``' ``block_n``, which no measurement covers.
     """
+    from tileops.utils import get_sm_version
+
+    if get_sm_version() != 90:
+        pytest.skip("the GEMM structures are SM90-only")
+
     assert GemmTmaKernel(1536, 2112, 256, torch.bfloat16, trans_b=True).config["block_n"] == 192
 
     requested = {"coop2s": True, "block_n": 64, "block_k": 128, "num_stages": 4}
@@ -910,7 +1210,6 @@ def test_explicit_structure_config_is_taken_verbatim() -> None:
     assert "block_m" in merged and "panel_size" in merged
 
 
-@pytest.mark.sm90
 @pytest.mark.cuda_only
 @pytest.mark.smoke
 def test_gemm_routes_tma_misaligned_shapes_to_the_pipelined_mainloop() -> None:
@@ -925,6 +1224,11 @@ def test_gemm_routes_tma_misaligned_shapes_to_the_pipelined_mainloop() -> None:
 
     Routing only — the aligned shapes already run end to end in ``GemmFixture``.
     """
+    from tileops.utils import get_sm_version
+
+    if get_sm_version() != 90:
+        pytest.skip("the TMA alignment region is SM90-specific")
+
     nt, nn = GemmFwdOp(trans_a=False, trans_b=True), GemmFwdOp(trans_a=False, trans_b=False)
     fp = torch.bfloat16
 
@@ -984,7 +1288,6 @@ def test_b_tile_eviction_hint_follows_the_m_tile_count() -> None:
     assert _b_eviction(4096, 128) is None
 
 
-@pytest.mark.sm90
 @pytest.mark.cuda_only
 @pytest.mark.smoke
 def test_structure_routing_matches_test_ids() -> None:
@@ -999,6 +1302,11 @@ def test_structure_routing_matches_test_ids() -> None:
 
     Routing only — construction builds no JIT, so this stays smoke-fast.
     """
+    from tileops.utils import get_sm_version
+
+    if get_sm_version() != 90:
+        pytest.skip("structure routing is SM90-specific")
+
     expected = [
         ("smoke-fp16-square", 1024, 1024, 1024, torch.float16, False, "coop2s"),
         ("smoke-bf16-square", 1024, 1024, 1024, torch.bfloat16, False, "coop2s"),

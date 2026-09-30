@@ -1,3 +1,4 @@
+import dataclasses
 import warnings
 from typing import ClassVar, Dict, Mapping, Optional
 
@@ -184,6 +185,9 @@ class GemmFp8FwdOp(Op):
                 block $[\\lceil N/128 \\rceil \\times \\lceil K/128 \\rceil]$.
             bias: Optional bias, $[N]$, in ``out_dtype``.
 
+            For 1D2D scales, ``scale_a`` keeps its logical shape but must be
+            M-contiguous, with stride ``(1, M)``.
+
         Returns:
             The scaled product plus bias, $[M \\times N]$, in ``out_dtype``.
 
@@ -208,7 +212,7 @@ class GemmFp8FwdOp(Op):
 
         Never traced: kernel construction enters a TileLang builder.
         """
-        a, b, scale_a, scale_b = (t.contiguous() for t in (a, b, scale_a, scale_b))
+        a, b, scale_b = a.contiguous(), b.contiguous(), scale_b.contiguous()
         bias = None if bias is None else bias.contiguous()
         (m, k), n = a.shape, b.shape[0]
         call = GemmCall(
@@ -218,14 +222,29 @@ class GemmFp8FwdOp(Op):
             dtype=a.dtype,
             trans_b=True,
             scale_a_shape=tuple(scale_a.shape),
+            scale_a_stride=tuple(scale_a.stride()),
             scale_b_shape=tuple(scale_b.shape),
             out_dtype=self.out_dtype,
             has_bias=bias is not None,
             device=a.device,
             tune=self.tune,
         )
+        if call.block_scale_grid == "1d2d":
+            if call.scale_a_stride != (1, m):
+                raise ValueError(
+                    "1D2D FP8 scale_a must be M-contiguous with "
+                    f"stride {(1, m)}, got {call.scale_a_stride}"
+                )
+        else:
+            scale_a = scale_a.contiguous()
+            call = dataclasses.replace(call, scale_a_stride=tuple(scale_a.stride()))
         self.kernel = self.kernel_for("gemm_fp8", (a, b, scale_a, scale_b, bias), call)
-        return self.kernel(a, b, scale_a, scale_b, bias)
+        # Only the 1D2D kernel reads an M-major scale_a; every other candidate for
+        # these shapes takes it row-major.
+        kernel_scale_a = (
+            scale_a if isinstance(self.kernel, GemmFp81D2DFwdKernel) else scale_a.contiguous()
+        )
+        return self.kernel(a, b, kernel_scale_a, scale_b, bias)
 
     def compute_roof(self) -> str:
         return tensor_core_roof(self.last_call.ix["T"])

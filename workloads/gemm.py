@@ -98,18 +98,27 @@ class GemmFp8Workload(WorkloadBase):
                 raise ValueError("block128 FP8 workloads require k divisible by 128")
             return (self.m, self.k // 128), (self.n, self.k // 128)
         if self.scale_mode == "block128x128":
-            if self.k % 128 != 0:
-                raise ValueError("block128x128 FP8 workloads require k divisible by 128")
-            return (self.m, self.k // 128), (-(-self.n // 128), self.k // 128)
+            scale_k = -(-self.k // 128)
+            return (self.m, scale_k), (-(-self.n // 128), scale_k)
         raise ValueError(f"unknown FP8 GEMM scale_mode {self.scale_mode!r}")
 
     def gen_inputs(self) -> tuple[torch.Tensor, ...]:
         a = (torch.randn(self.m, self.k, device=run_device()) * 0.25).to(self.dtype).contiguous()
         b = (torch.randn(self.n, self.k, device=run_device()) * 0.25).to(self.dtype).contiguous()
         scale_a_shape, scale_b_shape = self._scale_shapes()
-        scale_a = (
-            0.5 + torch.rand(*scale_a_shape, device=run_device(), dtype=torch.float32)
-        ).contiguous()
+        if self.scale_mode == "block128x128":
+            # Public shape [M, K/128], physically M-contiguous so one K block's
+            # row scales form the contiguous TMA box the 1D2D kernel consumes.
+            scale_a = (
+                0.5
+                + torch.rand(
+                    scale_a_shape[1], scale_a_shape[0], device=run_device(), dtype=torch.float32
+                )
+            ).T
+        else:
+            scale_a = (
+                0.5 + torch.rand(*scale_a_shape, device=run_device(), dtype=torch.float32)
+            ).contiguous()
         scale_b = (
             0.5 + torch.rand(*scale_b_shape, device=run_device(), dtype=torch.float32)
         ).contiguous()

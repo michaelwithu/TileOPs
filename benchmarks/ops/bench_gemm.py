@@ -156,9 +156,12 @@ def _flashinfer_fp8_blockscale_1d2d(
         )
     m, scale_k = scale_a.shape
     padded_m = -(-m // 4) * 4
-    m_major = torch.zeros((scale_k, padded_m), dtype=scale_a.dtype, device=scale_a.device)
-    m_major[:, :m] = scale_a.T
-    m_major_scale_a = torch.as_strided(m_major, (m, scale_k), (1, padded_m))
+    if padded_m == m and scale_a.stride() == (1, m):
+        m_major_scale_a = scale_a
+    else:
+        m_major = torch.zeros((scale_k, padded_m), dtype=scale_a.dtype, device=scale_a.device)
+        m_major[:, :m] = scale_a.T
+        m_major_scale_a = torch.as_strided(m_major, (m, scale_k), (1, padded_m))
 
     def run(a: torch.Tensor, b: torch.Tensor, *_: torch.Tensor) -> torch.Tensor:
         return gemm(a, b, m_major_scale_a, scale_b, out_dtype=workload.out_dtype)
@@ -181,7 +184,7 @@ def _deepgemm_fp8_1d2d(
     if workload.out_dtype != torch.bfloat16:
         raise ValueError("DeepGEMM FP8 GEMM baseline requires bfloat16 output.")
     m, n = workload.m, workload.n
-    aligned_scale_a = align(inputs[2])
+    aligned_scale_a = inputs[2] if m % 4 == 0 and inputs[2].stride() == (1, m) else align(inputs[2])
     scale_b = inputs[3]
 
     def run(a: torch.Tensor, b: torch.Tensor, *_: torch.Tensor) -> torch.Tensor:
